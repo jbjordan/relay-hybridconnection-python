@@ -48,16 +48,11 @@ class TestFromConnectionString:
         assert client.token_provider is not None
 
     def test_anonymous_from_connection_string(self):
+        """Anonymous senders may omit SharedAccessKeyName/SharedAccessKey."""
         conn = "Endpoint=sb://contoso.servicebus.windows.net/;EntityPath=hc1"
-        # Anonymous senders: no SharedAccessKey, but EntityPath required.
-        # Should construct without a token provider.
-        try:
-            client = HybridConnectionClient.from_connection_string(conn)
-        except ValueError:
-            # Some validators may require SAS keys; either is acceptable
-            pytest.skip("Connection string parser requires SAS keys for now")
-        else:
-            assert client.token_provider is None
+        client = HybridConnectionClient.from_connection_string(conn)
+        assert client.token_provider is None
+        assert "contoso.servicebus.windows.net/hc1" in client.address
 
     def test_missing_entity_path_raises(self):
         conn = (

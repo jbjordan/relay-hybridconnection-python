@@ -12,7 +12,10 @@ class RelayConnectionStringBuilder:
     SHARED_ACCESS_KEY_KEY = "SharedAccessKey"
     ENTITY_PATH_KEY = "EntityPath"
 
-    REQUIRED_KEYS = [ENDPOINT_KEY, SHARED_ACCESS_KEY_NAME_KEY, SHARED_ACCESS_KEY_KEY]
+    # Endpoint is the only field required to construct a valid connection
+    # string. SharedAccessKeyName/SharedAccessKey are optional: anonymous
+    # senders for Hybrid Connections may omit them.
+    REQUIRED_KEYS = [ENDPOINT_KEY]
 
     def __init__(self, connection_string: Optional[str] = None):
         """Initialize the connection string builder.
@@ -46,6 +49,16 @@ class RelayConnectionStringBuilder:
         missing_keys = [key for key in self.REQUIRED_KEYS if key not in parts]
         if missing_keys:
             raise ValueError(f"Connection string is missing required fields: {', '.join(missing_keys)}")
+
+        # SAS key name and value must either both be present or both be
+        # absent. A name without a value (or vice versa) is invalid.
+        has_key_name = self.SHARED_ACCESS_KEY_NAME_KEY in parts
+        has_key_value = self.SHARED_ACCESS_KEY_KEY in parts
+        if has_key_name != has_key_value:
+            raise ValueError(
+                "Connection string must specify both SharedAccessKeyName and "
+                "SharedAccessKey, or neither (for anonymous senders)"
+            )
 
         self._endpoint = parts.get(self.ENDPOINT_KEY)
         self._shared_access_key_name = parts.get(self.SHARED_ACCESS_KEY_NAME_KEY)
