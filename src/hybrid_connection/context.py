@@ -3,7 +3,7 @@ RelayedHttpListenerRequest and RelayedHttpListenerResponse classes
 for handling HTTP requests and responses over Azure Relay Hybrid Connections.
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Awaitable, Callable
 from io import BytesIO
 
 
@@ -115,13 +115,24 @@ class RelayedHttpListenerResponse:
     and response body for requests received via Azure Relay.
     """
     
-    def __init__(self):
-        """Initialize a RelayedHttpListenerResponse with default values."""
+    def __init__(
+        self,
+        close_callback: Optional[Callable[["RelayedHttpListenerResponse"], Awaitable[None]]] = None,
+    ):
+        """Initialize a RelayedHttpListenerResponse with default values.
+
+        Args:
+            close_callback: Optional async callback invoked on the first call
+                to ``close()``. The listener uses this so handlers that call
+                ``await context.response.close()`` cause the response to be
+                sent immediately.
+        """
         self._status_code = 200
         self._status_description = "OK"
         self._headers: Dict[str, str] = {}
         self._output_stream = BytesIO()
         self._is_closed = False
+        self._close_callback = close_callback
     
     @property
     def status_code(self) -> int:
@@ -141,11 +152,12 @@ class RelayedHttpListenerResponse:
         return self._status_description
     
     @status_description.setter
-    def status_description(self, value: str):
-        """Set the HTTP status description."""
+    def status_description(self, value: Optional[str]):
+        """Set the HTTP status description. ``None`` clears any value."""
         if self._is_closed:
             raise RuntimeError("Cannot modify response after it has been closed")
-        self._status_description = value
+        # Per the .NET behavior, allow clearing the status description.
+        self._status_description = value if value is not None else ""
     
     @property
     def headers(self) -> Dict[str, str]:
@@ -187,14 +199,19 @@ class RelayedHttpListenerResponse:
     
     async def close(self):
         """
-        Close the response and finalize it for sending.
-        
-        This method marks the response as closed and prevents further modifications.
-        In the full implementation, this would trigger sending the response via WebSocket.
+        Close the response, marking it ready to be sent.
+
+        If a close callback was supplied (typical when the response came from
+        a listener), invoking ``close()`` triggers the response to be sent
+        immediately. Subsequent calls are no-ops.
         """
         if self._is_closed:
             return
         self._is_closed = True
+        if self._close_callback is not None:
+            cb = self._close_callback
+            self._close_callback = None
+            await cb(self)
 
 
 class RelayedHttpListenerContext:
@@ -205,15 +222,38 @@ class RelayedHttpListenerContext:
     providing a unified interface for handling relayed HTTP traffic.
     """
     
-    def __init__(self, request: RelayedHttpListenerRequest):
+    def __init__(
+        self,
+        request: RelayedHttpListenerRequest,
+        *,
+        tracking_id: Optional[str] = None,
+        is_websocket_upgrade: bool = False,
+        rendezvous_address: Optional[str] = None,
+        response_close_callback: Optional[
+            Callable[["RelayedHttpListenerResponse"], Awaitable[None]]
+        ] = None,
+    ):
         """
         Initialize a RelayedHttpListenerContext.
-        
+
         Args:
-            request: The incoming HTTP request
+            request: The incoming HTTP request.
+            tracking_id: Optional tracking id for this exchange.
+            is_websocket_upgrade: True when the context represents a sender's
+                WebSocket connect request being inspected by an accept
+                handler (the "request" is synthetic, derived from the
+                ``connectHeaders`` of the accept message).
+            rendezvous_address: Optional rendezvous URL associated with this
+                exchange (the listener may need it to upgrade the response).
+            response_close_callback: Optional async callback passed through to
+                the response; triggered on the first call to
+                ``response.close()``.
         """
         self._request = request
-        self._response = RelayedHttpListenerResponse()
+        self._response = RelayedHttpListenerResponse(close_callback=response_close_callback)
+        self._tracking_id = tracking_id
+        self._is_websocket_upgrade = is_websocket_upgrade
+        self._rendezvous_address = rendezvous_address
     
     @property
     def request(self) -> RelayedHttpListenerRequest:
@@ -224,3 +264,24 @@ class RelayedHttpListenerContext:
     def response(self) -> RelayedHttpListenerResponse:
         """Get the HTTP response."""
         return self._response
+
+    @property
+    def tracking_id(self) -> Optional[str]:
+        """Get the tracking id for this exchange (may be ``None``)."""
+        return self._tracking_id
+
+    @property
+    def is_websocket_upgrade(self) -> bool:
+        """Whether the context represents a pending WebSocket rendezvous.
+
+        Inside ``HybridConnectionListener.accept_handler`` this is True, and
+        any status set on ``response`` is used as the WebSocket reject
+        reason when the handler returns ``False``.
+        """
+        return self._is_websocket_upgrade
+
+    @property
+    def rendezvous_address(self) -> Optional[str]:
+        """The rendezvous WebSocket address associated with this exchange."""
+        return self._rendezvous_address
+

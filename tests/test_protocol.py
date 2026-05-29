@@ -292,15 +292,19 @@ class TestBuildRenewTokenMessage:
     """Tests for building renewToken messages."""
 
     def test_build_renew_token_message(self):
-        """Test building a renewToken message."""
+        """Test building a renewToken message uses the correct wire shape.
+
+        The Azure Relay service expects:
+            {"renewToken": {"token": "..."}}
+        """
         token = "new_token_value"
 
         message_json = ProtocolHandler.build_renew_token_message(token)
 
         message = json.loads(message_json)
 
-        assert message['type'] == 'renewToken'
-        assert message['token'] == token
+        assert 'renewToken' in message
+        assert message['renewToken']['token'] == token
 
     def test_renew_token_is_valid_json(self):
         """Test that the renewToken message is valid JSON."""
