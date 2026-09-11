@@ -15,6 +15,7 @@ import string
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from websockets.exceptions import ConnectionClosedOK
 
 from src.hybrid_connection.listener import HybridConnectionListener
 from src.hybrid_connection.token_provider import TokenProvider
@@ -140,6 +141,7 @@ class TestSmallRequestLargeResponse:
         rendezvous_ws = MagicMock()
         rendezvous_ws.send = AsyncMock()
         rendezvous_ws.close = AsyncMock()
+        rendezvous_ws.recv = AsyncMock(side_effect=ConnectionClosedOK(None, None))
 
         with patch(
             "src.hybrid_connection.listener.websockets.connect",
@@ -156,6 +158,7 @@ class TestSmallRequestLargeResponse:
                 },
                 body=b"",
             )
+            await asyncio.gather(*listener._dispatch_tasks)
 
         # The control-channel WebSocket should NOT have been used for response.
         assert not ws.send.await_args_list
@@ -172,7 +175,7 @@ class TestSmallRequestLargeResponse:
         assert header["statusDescription"] == "TestStatusDescription"
         assert header["body"] is True
         assert sent[1] == big_body
-        rendezvous_ws.close.assert_awaited()
+        assert not listener._open_streams
 
 
 class TestEmptyRequestEmptyResponse:
@@ -355,8 +358,6 @@ class TestRendezvousRequestPointer:
         # 1) JSON request envelope
         # 2) binary request body
         # 3) ConnectionClosed (to terminate the rendezvous serve loop)
-        from websockets.exceptions import ConnectionClosed
-
         rendezvous_ws.recv = AsyncMock(
             side_effect=[
                 json.dumps(
@@ -371,7 +372,7 @@ class TestRendezvousRequestPointer:
                     }
                 ),
                 b"X" * 100_000,  # >64KB
-                ConnectionClosed(None, None),
+                ConnectionClosedOK(None, None),
             ]
         )
 
@@ -432,3 +433,231 @@ class TestControlChannelLimitBoundary:
         # No rendezvous needed at exactly the limit.
         connect.assert_not_called()
         assert len(_parse_sent_messages(ws)) == 2
+
+
+@pytest.mark.asyncio
+async def test_task_returning_request_handler_is_awaited():
+    listener = _make_listener()
+    websocket = _capture_control_websocket(listener)
+    handler_tasks = []
+
+    def handler(context):
+        async def respond():
+            await asyncio.sleep(0)
+            context.response.output_stream.write(b"completed")
+
+        task = asyncio.create_task(respond())
+        handler_tasks.append(task)
+        return task
+
+    listener.request_handler = handler
+    try:
+        await listener._handle_control_request(
+            {"id": "task", "method": "GET", "requestTarget": "/"}, b""
+        )
+        assert _parse_sent_messages(websocket)[-1] == b"completed"
+        assert all(task.done() for task in handler_tasks)
+    finally:
+        await asyncio.gather(*handler_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_automatic_response_completion_marks_response_closed():
+    listener = _make_listener()
+    _capture_control_websocket(listener)
+    responses = []
+    listener.request_handler = lambda context: responses.append(context.response)
+
+    await listener._handle_control_request(
+        {"id": "automatic", "method": "GET", "requestTarget": "/"}, b""
+    )
+
+    assert responses[0].is_closed
+    with pytest.raises(RuntimeError):
+        responses[0].output_stream.write(b"too late")
+
+
+@pytest.mark.asyncio
+async def test_response_frames_stay_on_the_same_control_websocket():
+    listener = _make_listener()
+    original = _capture_control_websocket(listener)
+    replacement = MagicMock()
+    replacement.send = AsyncMock()
+
+    async def send(payload):
+        if isinstance(payload, str):
+            listener._websocket = replacement
+            await asyncio.sleep(0)
+
+    original.send.side_effect = send
+    listener.request_handler = lambda context: context.response.output_stream.write(
+        b"response body"
+    )
+
+    await listener._handle_control_request(
+        {"id": "original", "method": "GET", "requestTarget": "/"}, b""
+    )
+
+    assert _parse_sent_messages(original)[-1] == b"response body"
+    replacement.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_response_after_reconnect_uses_rendezvous_not_new_control_channel():
+    listener = _make_listener()
+    _capture_control_websocket(listener)
+    replacement = MagicMock()
+    replacement.send = AsyncMock()
+
+    def handler(context):
+        listener._websocket = replacement
+        context.response.output_stream.write(b"reply")
+
+    listener.request_handler = handler
+    with patch.object(
+        listener, "_upgrade_response_to_rendezvous", new=AsyncMock()
+    ) as upgrade:
+        await listener._handle_control_request(
+            {
+                "id": "old-request",
+                "method": "GET",
+                "requestTarget": "/",
+                "address": "wss://dc/p?sb-hc-action=request",
+            },
+            b"",
+        )
+        upgrade.assert_awaited_once()
+        replacement.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_response_upgrade_serves_followup_requests():
+    listener = _make_listener()
+    control = _capture_control_websocket(listener)
+    requested_urls = []
+
+    def handler(context):
+        requested_urls.append(context.request.url)
+        body = b"x" * (65 * 1024) if context.request.url == "/large" else b"next"
+        context.response.output_stream.write(body)
+
+    listener.request_handler = handler
+    rendezvous = MagicMock()
+    rendezvous.send = AsyncMock()
+    rendezvous.close = AsyncMock()
+    rendezvous.recv = AsyncMock(
+        side_effect=[
+            json.dumps(
+                {"request": {"id": "next", "method": "GET", "requestTarget": "/next"}}
+            ),
+            ConnectionClosedOK(None, None),
+        ]
+    )
+    with patch(
+        "src.hybrid_connection.listener.websockets.connect",
+        new=AsyncMock(return_value=rendezvous),
+    ):
+        await listener._handle_control_request(
+            {
+                "id": "large",
+                "method": "GET",
+                "requestTarget": "/large",
+                "address": "wss://dc/p?sb-hc-action=request",
+            },
+            b"",
+        )
+        await asyncio.gather(*listener._dispatch_tasks)
+
+    assert requested_urls == ["/large", "/next"]
+    sent = _parse_sent_messages(rendezvous)
+    assert json.loads(sent[2])["response"]["requestId"] == "next"
+    assert sent[3] == b"next"
+    control.send.assert_not_awaited()
+    assert not listener._open_streams
+
+
+@pytest.mark.asyncio
+async def test_response_close_does_not_wait_for_rendezvous_peer():
+    listener = _make_listener()
+    _capture_control_websocket(listener)
+    handler_finished = asyncio.Event()
+    rendezvous = MagicMock()
+    rendezvous.send = AsyncMock()
+    rendezvous.close = AsyncMock()
+    rendezvous.recv = AsyncMock(side_effect=asyncio.Event().wait)
+
+    async def handler(context):
+        context.response.output_stream.write(b"x" * (65 * 1024))
+        await context.response.close()
+        handler_finished.set()
+
+    listener.request_handler = handler
+    with patch(
+        "src.hybrid_connection.listener.websockets.connect",
+        new=AsyncMock(return_value=rendezvous),
+    ):
+        try:
+            await asyncio.wait_for(
+                listener._handle_control_request(
+                    {
+                        "id": "large",
+                        "method": "GET",
+                        "requestTarget": "/",
+                        "address": "wss://dc/p?sb-hc-action=request",
+                    },
+                    b"",
+                ),
+                timeout=1,
+            )
+            assert handler_finished.is_set()
+            assert listener._open_streams
+            rendezvous.close.assert_not_awaited()
+        finally:
+            await listener.close()
+    rendezvous.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_large_http_body_can_exceed_websockets_default_limit():
+    import websockets
+
+    listener = _make_listener()
+    body = b"x" * (2 * 1024 * 1024)
+    received_bodies = []
+    replies = []
+
+    def handler(context):
+        received_bodies.append(context.request.read_body())
+        context.response.output_stream.write(b"received")
+
+    listener.request_handler = handler
+
+    async def relay(websocket):
+        await websocket.send(
+            json.dumps(
+                {
+                    "request": {
+                        "id": "large-upload",
+                        "method": "POST",
+                        "requestTarget": "/upload",
+                        "body": True,
+                    }
+                }
+            )
+        )
+        await websocket.send([body[:1024], body[1024:]])
+        replies.append(await websocket.recv())
+        replies.append(await websocket.recv())
+
+    async with websockets.serve(relay, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        await asyncio.wait_for(
+            listener._handle_rendezvous_request(
+                f"ws://127.0.0.1:{port}/request?sb-hc-action=request"
+            ),
+            timeout=3,
+        )
+
+    assert received_bodies == [body]
+    assert json.loads(replies[0])["response"]["requestId"] == "large-upload"
+    assert replies[1] == b"received"

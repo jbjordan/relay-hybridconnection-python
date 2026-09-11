@@ -87,7 +87,7 @@ async def main():
     listener.on_offline = lambda: print("Offline - Disconnected from relay")
     
     # Define the request handler
-    def request_handler(context):
+    async def request_handler(context):
         """Handle incoming HTTP requests."""
         print(f"Received {context.request.http_method} request to {context.request.url}")
         
@@ -99,9 +99,7 @@ async def main():
         # Write the HTML response
         context.response.output_stream.write(HTML_RESPONSE.encode('utf-8'))
         
-        # Note: In the real implementation, close() would be async
-        # For now, we'll handle it as if it were sync for simplicity
-        asyncio.create_task(context.response.close())
+        await context.response.close()
     
     listener.request_handler = request_handler
     

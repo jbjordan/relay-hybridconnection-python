@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
 
 from src.hybrid_connection.stream import (
     HybridConnectionStream,
@@ -40,6 +40,16 @@ class TestStreamMetadata:
 
 
 class TestStreamSend:
+    @pytest.mark.asyncio
+    async def test_send_failure_marks_stream_closed(self):
+        ws = _fake_ws()
+        ws.send.side_effect = ConnectionClosedError(None, None)
+        stream = HybridConnectionStream(ws)
+
+        with pytest.raises(ConnectionError):
+            await stream.send_bytes(b"data")
+        assert stream.is_closed
+
     @pytest.mark.asyncio
     async def test_send_text(self):
         ws = _fake_ws()
@@ -150,6 +160,32 @@ class TestStreamReceive:
 
 class TestStreamClose:
     @pytest.mark.asyncio
+    async def test_failed_close_can_be_retried(self):
+        ws = _fake_ws()
+        ws.close.side_effect = [ValueError("Invalid close code"), None]
+        stream = HybridConnectionStream(ws)
+
+        with pytest.raises(ValueError, match="Invalid close code"):
+            await stream.close(code=999)
+        assert not stream.is_closed
+        await stream.close()
+        assert stream.is_closed
+        assert ws.close.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cancelled_close_can_be_retried(self):
+        ws = _fake_ws()
+        ws.close.side_effect = [asyncio.CancelledError(), None]
+        stream = HybridConnectionStream(ws)
+
+        with pytest.raises(asyncio.CancelledError):
+            await stream.close()
+        assert not stream.is_closed
+        await stream.close()
+        assert stream.is_closed
+        assert ws.close.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_close_invokes_websocket_close(self):
         ws = _fake_ws()
         stream = HybridConnectionStream(ws)
@@ -168,22 +204,42 @@ class TestStreamClose:
         ws.close.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_close_swallows_inner_exceptions(self):
+    async def test_close_propagates_inner_exceptions(self):
         ws = _fake_ws()
         ws.close.side_effect = RuntimeError("network broke")
         stream = HybridConnectionStream(ws)
 
-        await stream.close()
-        assert stream.is_closed is True
+        with pytest.raises(RuntimeError, match="network broke"):
+            await stream.close()
+        assert stream.is_closed is False
 
 
 class TestStreamAsyncIteration:
+    @pytest.mark.asyncio
+    async def test_abnormal_close_is_not_silently_treated_as_eof(self):
+        ws = _fake_ws()
+        ws.recv.side_effect = [b"partial", ConnectionClosedError(None, None)]
+        stream = HybridConnectionStream(ws)
+
+        assert await anext(stream) == (b"partial", MESSAGE_TYPE_BINARY)
+        with pytest.raises(ConnectionError):
+            await anext(stream)
+
+    @pytest.mark.asyncio
+    async def test_receive_network_error_is_not_silently_treated_as_eof(self):
+        ws = _fake_ws()
+        ws.recv.side_effect = ConnectionResetError("Connection reset")
+        stream = HybridConnectionStream(ws)
+
+        with pytest.raises(ConnectionResetError):
+            await anext(stream)
+
     @pytest.mark.asyncio
     async def test_async_iteration_yields_messages(self):
         ws = _fake_ws()
         messages = ["one", b"two", "three"]
         ws.recv.side_effect = messages + [
-            ConnectionClosed(None, None)
+            ConnectionClosedOK(None, None)
         ]
         stream = HybridConnectionStream(ws)
 

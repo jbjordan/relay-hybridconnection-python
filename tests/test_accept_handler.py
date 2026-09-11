@@ -146,6 +146,43 @@ class TestAcceptHandlerCustom:
 
 class TestAcceptHandlerReject:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("use_task", [False, True])
+    async def test_awaitable_rejection_is_not_treated_as_truthy(self, use_task):
+        listener = _build_listener()
+
+        async def reject():
+            await asyncio.sleep(0)
+            return False
+
+        if use_task:
+            decision = asyncio.create_task(reject())
+        else:
+            decision = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(decision.set_result, False)
+        listener.accept_handler = lambda _context: decision
+
+        websocket = MagicMock()
+        websocket.close = AsyncMock()
+        with patch(
+            "src.hybrid_connection.listener.websockets.connect",
+            new=AsyncMock(return_value=websocket),
+        ) as connect:
+            try:
+                await listener._handle_accept(
+                    {
+                        "address": "wss://dc-node/p?sb-hc-action=accept",
+                        "id": "id-1",
+                        "connect_headers": {},
+                    }
+                )
+                query = parse_qs(urlsplit(connect.call_args.args[0]).query)
+                assert query["sb-hc-statusCode"] == ["400"]
+                assert listener._pending_connections.empty()
+            finally:
+                await decision
+                await listener.close()
+
+    @pytest.mark.asyncio
     async def test_reject_with_default_status(self):
         listener = _build_listener()
         listener.accept_handler = lambda _ctx: False
@@ -314,3 +351,24 @@ class TestReceiveLoopDispatch:
                 await task
             except asyncio.CancelledError:
                 pass
+
+    @pytest.mark.asyncio
+    async def test_malformed_envelope_does_not_disconnect_listener(self, caplog):
+        listener = _build_listener()
+        listener._is_online = True
+        websocket = MagicMock()
+        websocket.recv = AsyncMock(
+            side_effect=[
+                '{"accept": 42}',
+                '{"request": {"id": "valid", "method": "GET", "requestTarget": "/"}}',
+                asyncio.CancelledError(),
+            ]
+        )
+        listener._websocket = websocket
+        with patch.object(listener, "_handle_control_request", new=AsyncMock()) as handle:
+            with pytest.raises(asyncio.CancelledError):
+                await listener._receive_loop()
+            await _drain_dispatch_tasks(listener)
+            handle.assert_awaited_once()
+            assert listener.is_online
+            assert "malformed control message" in caplog.text

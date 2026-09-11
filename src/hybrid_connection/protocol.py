@@ -31,6 +31,24 @@ class ProtocolHandler:
     """Handles protocol-level operations for Azure Relay Hybrid Connections."""
 
     @staticmethod
+    def split_relay_address(address: str) -> Tuple[str, str]:
+        """Return the namespace and path/query without rewriting URL contents."""
+        parsed = urlsplit(address)
+        if (
+            parsed.scheme not in ("sb", "http", "https")
+            or not parsed.hostname
+            or not parsed.path.lstrip("/")
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("Invalid relay address: expected a namespace and entity path")
+        path = parsed.path.lstrip("/")
+        if parsed.query:
+            path += "?" + parsed.query
+        return parsed.netloc, path
+
+    @staticmethod
     def build_control_channel_url(namespace: str, path: str, token: str) -> str:
         """
         Build the WebSocket URL for the control channel.
@@ -47,7 +65,11 @@ class ProtocolHandler:
         encoded_token = quote(token, safe='')
         
         # Build the WebSocket URL with the listen action
-        url = f"wss://{namespace}/$hc/{path}?sb-hc-action=listen&sb-hc-token={encoded_token}"
+        separator = "&" if "?" in path else "?"
+        url = (
+            f"wss://{namespace}/$hc/{path}{separator}"
+            f"sb-hc-action=listen&sb-hc-token={encoded_token}"
+        )
         
         return url
 
@@ -79,24 +101,59 @@ class ProtocolHandler:
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON message: {e}")
 
+        if not isinstance(data, dict):
+            raise ValueError("Request message must be a JSON object")
+
         # Azure Relay wraps the request in a "request" object
         if 'request' not in data:
             raise ValueError("Message missing 'request' field")
 
-        request_data = data['request']
+        request_data = ProtocolHandler._message_object(data, 'request')
+        ProtocolHandler._validate_request(request_data)
+        return request_data
 
-        # A rendezvous-pointer request has only `address`; a full request has
-        # at minimum id, method, and requestTarget.
-        has_full = all(k in request_data for k in ('id', 'method', 'requestTarget'))
-        has_address_only = 'address' in request_data and not has_full
+    @staticmethod
+    def _message_object(data: Dict[str, Any], name: str) -> Dict[str, Any]:
+        value = data[name]
+        if not isinstance(value, dict):
+            raise ValueError(f"'{name}' must be a JSON object")
+        return value
 
-        if not has_full and not has_address_only:
+    @staticmethod
+    def _headers(data: Dict[str, Any], name: str) -> Dict[str, str]:
+        headers = data.get(name)
+        if headers is None:
+            return {}
+        if not isinstance(headers, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in headers.items()
+        ):
+            raise ValueError(f"'{name}' must be an object of string headers")
+        return headers
+
+    @staticmethod
+    def _validate_request(request_data: Dict[str, Any]) -> None:
+        address = request_data.get('address')
+        if 'address' in request_data and (
+            not isinstance(address, str) or not address
+        ):
+            raise ValueError("Request rendezvous 'address' must be a non-empty string")
+
+        if ProtocolHandler.is_rendezvous_pointer_request(request_data):
+            return
+
+        required = ('id', 'method', 'requestTarget')
+        if not all(key in request_data for key in required):
             raise ValueError(
                 "Request message missing required fields: needs either "
                 "(id, method, requestTarget) or rendezvous 'address'"
             )
-
-        return request_data
+        for key in required:
+            if not isinstance(request_data[key], str) or not request_data[key]:
+                raise ValueError(f"Request '{key}' must be a non-empty string")
+        ProtocolHandler._headers(request_data, 'requestHeaders')
+        if 'body' in request_data and not isinstance(request_data['body'], bool):
+            raise ValueError("Request 'body' must be a boolean")
 
     @staticmethod
     def is_rendezvous_pointer_request(request_data: Dict[str, Any]) -> bool:
@@ -129,7 +186,7 @@ class ProtocolHandler:
             - 'unknown':  { kind, raw }
 
         Raises:
-            ValueError: If the message is not valid JSON.
+            ValueError: If the message is not valid JSON or has invalid fields.
         """
         try:
             data = json.loads(message)
@@ -140,16 +197,17 @@ class ProtocolHandler:
             return {'kind': MESSAGE_KIND_UNKNOWN, 'raw': data}
 
         if 'accept' in data:
-            accept = data['accept'] or {}
+            accept = ProtocolHandler._message_object(data, 'accept')
             return {
                 'kind': MESSAGE_KIND_ACCEPT,
                 'address': accept.get('address'),
                 'id': accept.get('id'),
-                'connect_headers': accept.get('connectHeaders', {}) or {},
+                'connect_headers': ProtocolHandler._headers(accept, 'connectHeaders'),
             }
 
         if 'request' in data:
-            req = data['request'] or {}
+            req = ProtocolHandler._message_object(data, 'request')
+            ProtocolHandler._validate_request(req)
             if ProtocolHandler.is_rendezvous_pointer_request(req):
                 return {
                     'kind': MESSAGE_KIND_REQUEST_POINTER,
@@ -160,13 +218,13 @@ class ProtocolHandler:
                 'id': req.get('id'),
                 'method': req.get('method'),
                 'requestTarget': req.get('requestTarget'),
-                'requestHeaders': req.get('requestHeaders', {}) or {},
-                'body': bool(req.get('body', False)),
+                'requestHeaders': ProtocolHandler._headers(req, 'requestHeaders'),
+                'body': req.get('body', False),
                 'address': req.get('address'),
             }
 
         if 'renewToken' in data:
-            renew = data['renewToken'] or {}
+            renew = ProtocolHandler._message_object(data, 'renewToken')
             return {
                 'kind': MESSAGE_KIND_RENEW_TOKEN,
                 'token': renew.get('token'),
@@ -272,11 +330,11 @@ class ProtocolHandler:
             raise ValueError("Accept message must be a JSON object")
 
         if 'accept' in data:
-            accept = data['accept'] or {}
+            accept = ProtocolHandler._message_object(data, 'accept')
             return {
                 'address': accept.get('address'),
                 'id': accept.get('id'),
-                'connect_headers': accept.get('connectHeaders', {}) or {},
+                'connect_headers': ProtocolHandler._headers(accept, 'connectHeaders'),
             }
 
         if 'type' not in data:
@@ -392,7 +450,8 @@ class ProtocolHandler:
             query_pairs.append(("sb-hc-token", token))
 
         query = urlencode(query_pairs, quote_via=quote)
-        return f"wss://{namespace}/$hc/{path}?{query}"
+        separator = "&" if "?" in path else "?"
+        return f"wss://{namespace}/$hc/{path}{separator}{query}"
 
     @staticmethod
     def build_rendezvous_request_url(address: str) -> str:

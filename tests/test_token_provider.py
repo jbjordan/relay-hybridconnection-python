@@ -7,7 +7,7 @@ import secrets
 import string
 import time
 from unittest.mock import patch
-from urllib.parse import quote_plus, unquote_plus
+from urllib.parse import parse_qs, quote_plus, unquote_plus
 
 import pytest
 
@@ -174,6 +174,25 @@ class TestTokenProvider:
         token = provider.get_token("https://test.servicebus.windows.net/hc")
         
         assert f"skn={self.test_key_name}" in str(token)
+
+    def test_token_url_encodes_policy_name(self):
+        key_name = "policy +/=&"
+        provider = TokenProvider(key_name, self.test_key)
+        token = provider.get_token("sb://test.servicebus.windows.net/hc")
+
+        fields = parse_qs(token.token.removeprefix("SharedAccessSignature "))
+        assert fields["skn"] == [key_name]
+        assert set(fields) == {"sr", "sig", "se", "skn"}
+
+    @pytest.mark.parametrize("scheme", ["sb", "SB"])
+    def test_token_audience_omits_query_and_fragment(self, scheme):
+        provider = TokenProvider(self.test_key_name, self.test_key)
+        token = provider.get_token(
+            f"{scheme}://test.servicebus.windows.net/hc?app=value#fragment"
+        )
+
+        fields = parse_qs(token.token.removeprefix("SharedAccessSignature "))
+        assert fields["sr"] == ["http://test.servicebus.windows.net/hc"]
 
     def test_token_contains_encoded_audience(self):
         """Test token contains URL-encoded audience."""

@@ -5,6 +5,29 @@ import pytest
 from unittest.mock import AsyncMock, Mock
 
 
+DUMMY_CONNECTION_STRING = (
+    "Endpoint=sb://unit-tests.servicebus.windows.net/;"
+    "SharedAccessKeyName=unit-test-policy;"
+    "SharedAccessKey=dGVzdC1rZXk=;"
+    "EntityPath=unit-test-connection"
+)
+
+
+@pytest.fixture(autouse=True)
+def relay_test_environment(request, monkeypatch):
+    """Keep unit tests independent of credentials and gate live Azure access."""
+    if request.node.get_closest_marker("integration"):
+        disabled = os.getenv("SKIP_INTEGRATION", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if disabled or not os.getenv("relay-python"):
+            pytest.skip(
+                "Live Azure tests need relay-python set and SKIP_INTEGRATION disabled"
+            )
+        return
+    monkeypatch.setenv("relay-python", DUMMY_CONNECTION_STRING)
+
+
 def get_relay_connection_string() -> str:
     """Get the Azure Relay connection string from environment variable.
     

@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import time
 from typing import Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 
 class SecurityToken:
@@ -123,11 +123,12 @@ class TokenProvider:
         Returns:
             The SAS token string.
         """
-        # Azure Relay requires the audience URI to use http:// scheme (not sb://)
-        # and to be lowercase
-        if audience.startswith("sb://"):
-            audience = "http://" + audience[5:]
-        audience = audience.lower()
+        # SAS authorization targets the resource, not application query parameters.
+        parsed = urlsplit(audience)
+        scheme = "http" if parsed.scheme == "sb" else parsed.scheme
+        audience = urlunsplit(
+            (scheme, parsed.netloc, parsed.path, "", "")
+        ).lower()
         
         # URL encode the audience (resource URI)
         encoded_audience = quote_plus(audience)
@@ -150,7 +151,7 @@ class TokenProvider:
             f"sr={encoded_audience}&"
             f"sig={encoded_signature}&"
             f"se={expiry}&"
-            f"skn={self._key_name}"
+            f"skn={quote_plus(self._key_name)}"
         )
 
         return token

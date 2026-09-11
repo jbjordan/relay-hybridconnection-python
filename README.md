@@ -25,7 +25,7 @@ pip install -r requirements.txt
 
 ### Dependencies
 
-- `websockets>=12.0` - WebSocket client for control channel
+- `websockets>=14.0` - WebSocket client (uses the modern asyncio API)
 - `aiohttp>=3.9.0` - HTTP client for sender
 - `pytest>=8.0.0` - Testing framework
 - `pytest-asyncio>=0.23.0` - Async test support
@@ -173,10 +173,12 @@ listener = HybridConnectionListener(
 
 #### Methods
 
-- **`async open()`**: Opens the listener and establishes the control channel
+- **`async open()`**: Opens the listener and establishes the control channel; repeated calls do not create duplicate connections
 - **`async close()`**: Closes the listener gracefully (cancels in-flight tasks and drains accepted streams)
-- **`async accept_connection() -> HybridConnectionStream`**: Wait for and return the next accepted rendezvous WebSocket
-- **`async for stream in listener.connections(): ...`**: Async iterator over accepted rendezvous WebSockets
+- **`async accept_connection() -> HybridConnectionStream`**: Wait for and return the next accepted rendezvous WebSocket; raises `ConnectionError` when the listener is closed
+- **`async for stream in listener.connections(): ...`**: Async iterator over accepted rendezvous WebSockets; ends when the listener is closed
+
+If `listener.close()` is cancelled, await it again to finish shutdown before reopening the listener.
 
 ### HybridConnectionClient
 
@@ -214,8 +216,8 @@ The duplex WebSocket produced by a successful rendezvous. Returned by both `Hybr
 - **`async send(data)`**: Send `str` as text frame or bytes-like as binary frame
 - **`async send_text(text)`** / **`async send_bytes(data)`**: Strict variants
 - **`async receive() -> (payload, "text" | "binary")`**
-- **`async for payload, kind in stream: ...`**: Async iteration support
-- **`async close(code=1000, reason="")`**: Close the stream
+- **`async for payload, kind in stream: ...`**: Ends on normal closure; raises `ConnectionError` on abnormal disconnection instead of silently truncating the transfer
+- **`async close(code=1000, reason="")`**: Close the stream; errors propagate, and failed or cancelled closes can be retried
 
 ### RelayedHttpListenerContext
 
@@ -261,7 +263,7 @@ Represents an outgoing HTTP response.
 
 #### Methods
 
-- **`async close()`**: Finalizes the response. If a body or headers were set after the listener captured the context, the listener uses them as the response payload.
+- **`async close()`**: Finalizes and sends the response once. The listener also closes the response automatically when the request handler returns.
 
 ### TokenProvider
 
@@ -316,6 +318,10 @@ python samples/websocket_sender.py
 You should see the sender print three round-trip text messages and one binary round-trip, while the listener logs each session.
 
 ## Running Tests
+
+Unit tests use dummy credentials and do not require an Azure connection string.
+Live Azure tests run only when `relay-python` is set and `SKIP_INTEGRATION` is not
+enabled. Set `SKIP_INTEGRATION=1` (or `true`) to disable them explicitly.
 
 ### Run All Tests
 
@@ -401,6 +407,8 @@ This implementation follows the Azure Relay Hybrid Connections Protocol:
 
 3. **HTTP Response Transmission**: Sends JSON `response` messages with status code, headers, and optional binary body frames. Responses up to 64 kB are sent on the control channel; larger responses are automatically upgraded to a rendezvous WebSocket.
 
+   Upgraded HTTP rendezvous sockets remain open for subsequent requests from the same sender until the sender disconnects or the listener closes.
+
 4. **WebSocket Rendezvous (Accept)**: Receives JSON `accept` messages from the service when a sender opens a WebSocket. The `accept_handler` callback can inspect the `connectHeaders` and accept (return `True`) or reject (return `False` after optionally setting `response.status_code`/`response.status_description`). Accepted streams are queued for `accept_connection()` / `connections()`.
 
 5. **Sender Connect**: `HybridConnectionClient.create_connection()` opens `wss://<namespace>/$hc/<path>?sb-hc-action=connect[&sb-hc-id=…][&sb-hc-token=…]`. Custom headers are forwarded to the listener via the accept message.
@@ -425,6 +433,7 @@ This implementation supports:
 
 - Multiple listeners on the same Hybrid Connection (load balancing) is supported by the service but this client does not implement coordinated draining/leasing across listener instances; each listener simply registers and the service distributes work.
 - HTTP bodies are buffered in memory rather than streamed. Very large payloads (multi-MB) should be transferred via the WebSocket rendezvous if streaming is desired.
+- Duplex WebSocket streams retain the `websockets` default 1 MiB incoming-message limit; split larger transfers into multiple messages. HTTP rendezvous bodies are not subject to that limit.
 
 ## Configuration
 

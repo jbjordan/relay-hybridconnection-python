@@ -3,6 +3,7 @@
 import secrets
 import string
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -69,6 +70,15 @@ class TestFromConnectionString:
 
 
 class TestCreateConnection:
+    def test_connect_preserves_urls_in_application_query(self):
+        client = HybridConnectionClient(
+            "sb://contoso.servicebus.windows.net/hc1?redirect=https://example.com/next"
+        )
+
+        query = parse_qs(urlsplit(client._build_connect_url()).query)
+        assert query["redirect"] == ["https://example.com/next"]
+        assert query["sb-hc-action"] == ["connect"]
+
     @pytest.mark.asyncio
     async def test_create_connection_anonymous_builds_correct_url(self):
         client = HybridConnectionClient("sb://contoso.servicebus.windows.net/hc1")

@@ -7,6 +7,7 @@ accept/request envelope handling described in the Hybrid Connections protocol.
 """
 
 import json
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -79,6 +80,23 @@ class TestBuildRendezvousRejectUrl:
 
 
 class TestBuildSenderConnectUrl:
+    def test_sender_url_preserves_application_query_parameters(self):
+        url = ProtocolHandler.build_sender_connect_url(
+            "contoso.servicebus.windows.net",
+            "hc1/suffix?app=one%20two&empty=",
+            token="token",
+            hc_id="diag-1",
+        )
+        parsed = urlsplit(url)
+        assert parsed.path == "/$hc/hc1/suffix"
+        assert parse_qs(parsed.query, keep_blank_values=True) == {
+            "app": ["one two"],
+            "empty": [""],
+            "sb-hc-action": ["connect"],
+            "sb-hc-id": ["diag-1"],
+            "sb-hc-token": ["token"],
+        }
+
     def test_anonymous_sender_url(self):
         url = ProtocolHandler.build_sender_connect_url(
             namespace="contoso.servicebus.windows.net",
@@ -193,6 +211,26 @@ class TestParseRequestMessageRendezvousPointer:
 
 
 class TestParseControlMessage:
+    @pytest.mark.parametrize("envelope", ["accept", "request", "renewToken"])
+    @pytest.mark.parametrize("payload", [None, [], ["invalid"], 42, "invalid"])
+    def test_invalid_nested_payload_raises_value_error(self, envelope, payload):
+        with pytest.raises(ValueError):
+            ProtocolHandler.parse_control_message(json.dumps({envelope: payload}))
+
+    @pytest.mark.parametrize(
+        "request_data",
+        [
+            {},
+            {"id": "1"},
+            {"id": "1", "method": None, "requestTarget": "/"},
+            {"id": "1", "method": "GET", "requestTarget": "/", "requestHeaders": []},
+            {"id": "1", "method": "GET", "requestTarget": "/", "body": "false"},
+        ],
+    )
+    def test_invalid_request_fields_are_rejected(self, request_data):
+        with pytest.raises(ValueError):
+            ProtocolHandler.parse_control_message(json.dumps({"request": request_data}))
+
     def test_parses_accept_message(self):
         message = json.dumps({
             "accept": {
@@ -252,6 +290,29 @@ class TestParseControlMessage:
 class TestControlChannelLimit:
     def test_limit_constant_is_64k(self):
         assert CONTROL_CHANNEL_MAX_BODY_SIZE == 64 * 1024
+
+
+class TestSplitRelayAddress:
+    @pytest.mark.parametrize("scheme", ["sb", "SB", "http", "https"])
+    def test_parses_scheme_without_changing_query_values(self, scheme):
+        assert ProtocolHandler.split_relay_address(
+            f"{scheme}://namespace:443/hc/suffix?redirect=https://example.com/"
+        ) == ("namespace:443", "hc/suffix?redirect=https://example.com/")
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "not-a-url",
+            "sb:///missing-host",
+            "sb://namespace/",
+            "ftp://namespace/hc",
+            "sb://namespace/hc#fragment",
+            "sb://user:password@namespace/hc",
+        ],
+    )
+    def test_rejects_invalid_relay_addresses(self, address):
+        with pytest.raises(ValueError):
+            ProtocolHandler.split_relay_address(address)
 
 
 class TestRenewTokenRoundTrip:
