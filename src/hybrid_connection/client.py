@@ -127,8 +127,4 @@ class HybridConnectionClient:
 
 def _split_address(address: str) -> tuple[str, str]:
     """Return (namespace, path) for a relay address."""
-    stripped = address.replace("sb://", "").replace("https://", "")
-    parts = stripped.split("/", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise ValueError(f"Invalid relay address: {address!r}")
-    return parts[0], parts[1]
+    return ProtocolHandler.split_relay_address(address)

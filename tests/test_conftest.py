@@ -4,6 +4,18 @@ import pytest
 from unittest.mock import AsyncMock
 
 
+def test_unit_tests_use_dummy_credentials(connection_string):
+    from tests.conftest import DUMMY_CONNECTION_STRING
+
+    assert connection_string == DUMMY_CONNECTION_STRING
+
+
+def test_live_relay_url_has_no_duplicate_slash(connection_string, namespace, path):
+    from tests.test_integration import relay_url
+
+    assert relay_url.__wrapped__(connection_string) == f"https://{namespace}/{path}"
+
+
 def test_connection_string_fixture(connection_string):
     """Test that connection_string fixture returns valid string."""
     assert isinstance(connection_string, str)

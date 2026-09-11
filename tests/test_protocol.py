@@ -57,6 +57,11 @@ class TestBuildControlChannelUrl:
 class TestParseRequestMessage:
     """Tests for parsing request JSON messages from the control channel."""
 
+    @pytest.mark.parametrize("payload", [None, 42, ["request"], "request"])
+    def test_non_object_envelope_raises_value_error(self, payload):
+        with pytest.raises(ValueError):
+            ProtocolHandler.parse_request_message(json.dumps(payload))
+
     def test_parse_valid_get_request(self):
         """Test parsing a valid GET request message."""
         message = json.dumps({

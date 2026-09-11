@@ -12,8 +12,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, Optional, Tuple, Union
 
-import websockets
 from websockets.exceptions import ConnectionClosed as _WSConnectionClosed
+from websockets.exceptions import ConnectionClosedOK as _WSConnectionClosedOK
 
 
 # Message type constants returned alongside payloads from `receive()`.
@@ -81,7 +81,11 @@ class HybridConnectionStream:
         """
         if self._closed:
             raise RuntimeError("Cannot send on a closed HybridConnectionStream")
-        await self._websocket.send(data)
+        try:
+            await self._websocket.send(data)
+        except _WSConnectionClosed as exc:
+            self._closed = True
+            raise ConnectionError(f"HybridConnectionStream closed: {exc}") from exc
 
     async def send_text(self, text: str) -> None:
         """Send a text WebSocket frame."""
@@ -121,22 +125,25 @@ class HybridConnectionStream:
     async def close(self, code: int = 1000, reason: str = "") -> None:
         """
         Close the underlying WebSocket. Safe to call multiple times.
+
+        Close failures propagate so the caller can correct the parameters
+        or retry; a failed or cancelled close does not mark the stream closed.
         """
         async with self._close_lock:
             if self._closed:
                 return
+            await self._websocket.close(code=code, reason=reason)
             self._closed = True
-            try:
-                await self._websocket.close(code=code, reason=reason)
-            except Exception:
-                # Ignore close errors – the connection may already be gone.
-                pass
 
     def __aiter__(self) -> "HybridConnectionStream":
         return self
 
     async def __anext__(self) -> Tuple[Union[bytes, str], str]:
+        if self._closed:
+            raise StopAsyncIteration
         try:
             return await self.receive()
         except ConnectionError as exc:
-            raise StopAsyncIteration from exc
+            if isinstance(exc.__cause__, _WSConnectionClosedOK):
+                raise StopAsyncIteration from exc
+            raise

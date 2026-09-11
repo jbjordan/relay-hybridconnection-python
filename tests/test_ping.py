@@ -226,3 +226,31 @@ async def test_ping_stops_when_offline(listener):
             assert ping_count[0] <= initial_count + 1
         finally:
             await listener.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [TimeoutError("No pong"), OSError("Socket lost")])
+async def test_failed_ping_retires_connection_and_stops_reader(listener, failure):
+    listener._ping_interval = 0.01
+    websocket = AsyncMock()
+    websocket.recv.side_effect = asyncio.Event().wait
+    websocket.ping.side_effect = failure
+    offline = asyncio.Event()
+    listener.on_offline = offline.set
+
+    with patch(
+        "src.hybrid_connection.listener.websockets.connect",
+        new=AsyncMock(return_value=websocket),
+    ):
+        try:
+            await listener.open()
+            reader = listener._receive_task
+            renewal = listener._token_renewal_task
+            await asyncio.wait_for(offline.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+            assert not listener.is_online
+            assert reader.done()
+            assert renewal.done()
+            websocket.close.assert_awaited_once()
+        finally:
+            await listener.close()

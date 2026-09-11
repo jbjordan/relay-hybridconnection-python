@@ -2,21 +2,16 @@
 Integration tests for HybridConnectionListener with live Azure Relay.
 
 These tests connect to a real Azure Relay instance to validate
-the full request/response cycle. They will be skipped if the
-SKIP_INTEGRATION environment variable is set.
+the full request/response cycle. They are skipped when relay-python is unset
+or SKIP_INTEGRATION is enabled (1, true, yes, or on).
 """
 import pytest
 import asyncio
-import os
 import aiohttp
 from hybrid_connection import HybridConnectionListener
 
-# Skip all tests in this module if SKIP_INTEGRATION is set
+# The shared test fixture gates live tests before any network access.
 pytestmark = [
-    pytest.mark.skipif(
-        os.getenv("SKIP_INTEGRATION", "false").lower() == "true",
-        reason="Integration tests disabled via SKIP_INTEGRATION env var"
-    ),
     pytest.mark.integration,
     pytest.mark.timeout(120)  # 2 minute timeout for integration tests
 ]
@@ -32,7 +27,7 @@ def relay_url(connection_string):
             key, value = part.split("=", 1)
             parts[key] = value
     
-    endpoint = parts.get("Endpoint", "").replace("sb://", "")
+    endpoint = parts.get("Endpoint", "").replace("sb://", "").rstrip("/")
     entity_path = parts.get("EntityPath", "")
     
     return f"https://{endpoint}/{entity_path}"

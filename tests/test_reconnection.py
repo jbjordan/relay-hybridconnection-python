@@ -283,3 +283,326 @@ async def test_max_backoff_60_seconds(listener):
         
         # The important part is that the delay calculation caps at 60
         # This is tested via the implementation: min(2 ** (attempt - 1), 60)
+
+
+def _idle_websocket():
+    websocket = AsyncMock()
+    websocket.recv.side_effect = asyncio.Event().wait
+    return websocket
+
+
+async def _cancel_tasks(tasks):
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
+    await asyncio.gather(
+        *(task for task in tasks if task is not None), return_exceptions=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_retires_previous_control_channel(listener):
+    first = _idle_websocket()
+    second = _idle_websocket()
+    disconnected = asyncio.get_running_loop().create_future()
+    async def receive_until_disconnect():
+        return await disconnected
+
+    first.recv.side_effect = receive_until_disconnect
+    reconnected = asyncio.Event()
+    online_count = 0
+
+    def on_online():
+        nonlocal online_count
+        online_count += 1
+        if online_count == 2:
+            reconnected.set()
+
+    listener.on_online = on_online
+    old_tasks = []
+    with patch("websockets.connect", new=AsyncMock(side_effect=[first, second])):
+        try:
+            await listener.open()
+            old_tasks = [
+                listener._receive_task,
+                listener._ping_task,
+                listener._token_renewal_task,
+            ]
+            await asyncio.sleep(0)
+            disconnected.set_exception(
+                websockets.exceptions.ConnectionClosed(None, None)
+            )
+            await asyncio.wait_for(reconnected.wait(), timeout=3)
+
+            assert all(task.done() for task in old_tasks)
+            first.close.assert_awaited_once()
+            assert listener._websocket is second
+        finally:
+            await listener.close()
+            await _cancel_tasks(old_tasks)
+
+
+@pytest.mark.asyncio
+async def test_open_is_idempotent(listener):
+    websocket = _idle_websocket()
+    original_tasks = []
+    with patch("websockets.connect", new=AsyncMock(return_value=websocket)) as connect:
+        try:
+            await listener.open()
+            original_tasks = [
+                listener._receive_task,
+                listener._ping_task,
+                listener._token_renewal_task,
+            ]
+            await listener.open()
+            connect.assert_awaited_once()
+            assert original_tasks == [
+                listener._receive_task,
+                listener._ping_task,
+                listener._token_renewal_task,
+            ]
+        finally:
+            await listener.close()
+            await _cancel_tasks(original_tasks)
+
+
+@pytest.mark.asyncio
+async def test_close_during_open_does_not_leave_a_live_connection(listener):
+    connecting = asyncio.Event()
+    finish_connecting = asyncio.Event()
+    websocket = _idle_websocket()
+
+    async def connect(_url, **_kwargs):
+        connecting.set()
+        await finish_connecting.wait()
+        return websocket
+
+    with patch("websockets.connect", side_effect=connect):
+        opening = asyncio.create_task(listener.open())
+        await connecting.wait()
+        closing = asyncio.create_task(listener.close())
+        try:
+            await asyncio.sleep(0)
+            finish_connecting.set()
+            await asyncio.wait_for(asyncio.gather(opening, closing), timeout=1)
+            assert not listener.is_online
+            assert listener._websocket is None
+            websocket.close.assert_awaited_once()
+        finally:
+            finish_connecting.set()
+            await _cancel_tasks([opening, closing])
+            await listener.close()
+
+
+@pytest.mark.asyncio
+async def test_close_releases_all_pending_accepts(listener):
+    waiters = [
+        asyncio.create_task(listener.accept_connection()) for _ in range(3)
+    ]
+    try:
+        await asyncio.sleep(0)
+        await listener.close()
+        done, pending = await asyncio.wait(waiters, timeout=0.2)
+        assert not pending, "Closing the listener left accept_connection blocked"
+        assert all(isinstance(task.exception(), ConnectionError) for task in done)
+    finally:
+        await _cancel_tasks(waiters)
+
+
+@pytest.mark.asyncio
+async def test_close_ends_connections_iterator(listener):
+    iterator = listener.connections()
+    waiter = asyncio.create_task(anext(iterator))
+    try:
+        await asyncio.sleep(0)
+        await listener.close()
+        done, pending = await asyncio.wait({waiter}, timeout=0.2)
+        assert not pending, "Closing the listener left connections() blocked"
+        assert isinstance(waiter.exception(), StopAsyncIteration)
+    finally:
+        await _cancel_tasks([waiter])
+        await iterator.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reopen_does_not_revive_previous_accept_waiters(listener):
+    waiter = asyncio.create_task(listener.accept_connection())
+    with patch("websockets.connect", new=AsyncMock(return_value=_idle_websocket())):
+        try:
+            await asyncio.sleep(0)
+            await listener.close()
+            await listener.open()
+            done, pending = await asyncio.wait({waiter}, timeout=0.2)
+            assert not pending
+            assert isinstance(waiter.exception(), ConnectionError)
+            assert listener._pending_connections.empty()
+        finally:
+            await _cancel_tasks([waiter])
+            await listener.close()
+
+
+@pytest.mark.asyncio
+async def test_callback_failure_during_open_does_not_prevent_retry(listener):
+    first = _idle_websocket()
+    second = _idle_websocket()
+    listener.on_online = Mock(side_effect=RuntimeError("Online callback failed"))
+    listener.on_offline = Mock(side_effect=ValueError("Offline callback failed"))
+
+    with patch("websockets.connect", new=AsyncMock(side_effect=[first, second])) as connect:
+        try:
+            with pytest.raises(ValueError, match="Offline callback failed"):
+                await listener.open()
+            assert not listener._should_reconnect
+            assert listener._websocket is None
+            first.close.assert_awaited_once()
+
+            listener.on_online = None
+            listener.on_offline = None
+            await listener.open()
+            assert listener.is_online
+            assert connect.await_count == 2
+        finally:
+            listener.on_offline = None
+            await listener.close()
+
+
+@pytest.mark.asyncio
+async def test_handler_shutdown_does_not_reopen_a_response_socket(listener):
+    listener._websocket = _idle_websocket()
+    handler_finished = asyncio.Event()
+
+    async def handler(_context):
+        await listener.close()
+        handler_finished.set()
+
+    listener.request_handler = handler
+    with patch.object(
+        listener, "_upgrade_response_to_rendezvous", new=AsyncMock()
+    ) as upgrade:
+        listener._spawn_dispatch(
+            listener._handle_control_request(
+                {
+                    "id": "shutdown",
+                    "method": "GET",
+                    "requestTarget": "/",
+                    "address": "wss://dc/p?sb-hc-action=request",
+                },
+                b"",
+            )
+        )
+        await asyncio.wait_for(
+            asyncio.gather(*listener._dispatch_tasks, return_exceptions=True),
+            timeout=1,
+        )
+        assert handler_finished.is_set()
+        upgrade.assert_not_awaited()
+        assert not listener._open_streams
+
+
+@pytest.mark.asyncio
+async def test_cancelled_listener_close_can_be_retried(listener):
+    websocket = _idle_websocket()
+    closing_started = asyncio.Event()
+
+    async def close():
+        if websocket.close.await_count == 1:
+            closing_started.set()
+            await asyncio.Event().wait()
+
+    websocket.close.side_effect = close
+    with patch("websockets.connect", new=AsyncMock(return_value=websocket)):
+        await listener.open()
+        closing = asyncio.create_task(listener.close())
+        try:
+            await asyncio.wait_for(closing_started.wait(), timeout=1)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+            with pytest.raises(RuntimeError, match="shutdown is incomplete"):
+                await listener.open()
+
+            await listener.close()
+            assert websocket.close.await_count == 2
+            assert listener._websocket is None
+        finally:
+            await _cancel_tasks([closing])
+            await listener.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_task", [False, True])
+async def test_cancelled_handler_can_close_listener_in_finally(listener, use_task):
+    listener._websocket = _idle_websocket()
+    handler_started = asyncio.Event()
+    handler_finished = asyncio.Event()
+
+    async def handle(_context):
+        try:
+            handler_started.set()
+            await asyncio.Event().wait()
+        finally:
+            await listener.close()
+            handler_finished.set()
+
+    listener.request_handler = (
+        (lambda context: asyncio.create_task(handle(context))) if use_task else handle
+    )
+    listener._spawn_dispatch(
+        listener._handle_control_request(
+            {"id": "cancel", "method": "GET", "requestTarget": "/"}, b""
+        )
+    )
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+    await asyncio.wait_for(listener.close(), timeout=1)
+    assert handler_finished.is_set()
+    assert not listener._dispatch_tasks
+
+
+@pytest.mark.asyncio
+async def test_task_returning_handler_can_initiate_shutdown(listener):
+    listener._websocket = _idle_websocket()
+    handler_finished = asyncio.Event()
+
+    async def shutdown(context):
+        await context.response.close()
+        await listener.close()
+        handler_finished.set()
+
+    listener.request_handler = lambda context: asyncio.create_task(shutdown(context))
+    listener._spawn_dispatch(
+        listener._handle_control_request(
+            {"id": "shutdown", "method": "GET", "requestTarget": "/"}, b""
+        )
+    )
+    await asyncio.wait_for(
+        asyncio.gather(*listener._dispatch_tasks), timeout=1
+    )
+    assert handler_finished.is_set()
+    assert listener._websocket is None
+
+
+@pytest.mark.asyncio
+async def test_close_before_dispatch_starts_closes_its_coroutine(listener):
+    async def handle():
+        await asyncio.Event().wait()
+
+    coroutine = handle()
+    listener._spawn_dispatch(coroutine)
+    await listener.close()
+    assert coroutine.cr_frame is None
+
+
+@pytest.mark.asyncio
+async def test_listener_close_keeps_handed_off_stream_open(listener):
+    websocket = _idle_websocket()
+    with patch("websockets.connect", new=AsyncMock(return_value=websocket)):
+        await listener._handle_accept(
+            {"address": "wss://dc/p?sb-hc-action=accept", "id": "owned-by-caller"}
+        )
+    stream = await listener.accept_connection()
+    try:
+        await listener.close()
+        websocket.close.assert_not_awaited()
+        assert not stream.is_closed
+    finally:
+        await stream.close()
