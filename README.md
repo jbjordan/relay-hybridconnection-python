@@ -7,6 +7,7 @@ A Python implementation of the Azure Relay Hybrid Connection Protocol covering b
 - **HTTP request/response pattern**: Receive HTTP requests through a WebSocket control channel
 - **WebSocket rendezvous pattern**: Accept full-duplex WebSocket connections from senders, with an optional accept handler for inspecting / rejecting senders
 - **Large request/response handling**: Automatically upgrades large HTTP requests and responses (>64 kB) to a dedicated rendezvous WebSocket
+- **IPv6-first rendezvous**: Prefers reachable IPv6 addresses for direct listener rendezvous connections, with bounded IPv4 fallback
 - **Sender API (``HybridConnectionClient``)**: Open authenticated or anonymous WebSocket connections to a listener
 - **Automatic Reconnection**: Handles disconnections with exponential backoff
 - **Token Management**: Automatic SAS token renewal before expiration
@@ -26,6 +27,7 @@ pip install -r requirements.txt
 ### Dependencies
 
 - `websockets>=14.0` - WebSocket client (uses the modern asyncio API)
+- `aiohappyeyeballs>=2.6.2` - IPv6-first TCP connection racing and socket cleanup
 - `aiohttp>=3.9.0` - HTTP client for sender
 - `pytest>=8.0.0` - Testing framework
 - `pytest-asyncio>=0.23.0` - Async test support
@@ -157,7 +159,61 @@ listener = HybridConnectionListener(
     address="sb://<namespace>.servicebus.windows.net/<path>",
     token_provider=TokenProvider(key_name="<keyname>", shared_access_key="<key>"),
 )
+
+# Optional: retain legacy transport address selection for rendezvous.
+listener = HybridConnectionListener.from_connection_string(
+    connection_string, prefer_ipv6=False
+)
 ```
+
+Both constructors accept the keyword-only `prefer_ipv6` option, which defaults
+to `True`. Existing positional arguments are unchanged.
+
+#### IPv6-first rendezvous
+
+For direct connections, the listener tries IPv6 first even when the system
+resolver lists IPv4 first. If that TCP attempt fails, the next address is tried
+immediately; if it stalls, an IPv4 attempt starts after 250 ms when an IPv4
+address is available. Further attempts alternate address families. The first
+successful TCP connection performs one WebSocket handshake. DNS lookup, TCP
+selection, TLS, and the handshake share a 10-second opening timeout. Missing
+AAAA records, unsupported IPv6, and unreachable IPv6 routes can fall back to
+IPv4. TLS certificate errors and WebSocket handshake failures (including the
+expected HTTP 410 rejection response) do not trigger an IPv4 handshake retry.
+
+This policy applies to listener WebSocket accepts and rejects, HTTP
+request-pointer connections, and large-response rendezvous upgrades. Namespace
+listen/control connections, small HTTP exchanges on that channel, and
+`HybridConnectionClient` sender connections keep their existing behavior. The
+sender connects to the namespace; it does not reconnect to a gateway instance.
+
+The SDK uses the service-provided rendezvous hostname, path, query, and port;
+it does not synthesize an IPv6 hostname or enablement parameter. WSS retains the
+original hostname for TLS SNI and certificate validation. IPv6 requires both an
+AAAA record for that hostname and a working IPv6 route to it. An SDK upgrade
+cannot provision either prerequisite.
+
+System and configured proxy routes retain the installed `websockets` behavior:
+the SDK does not resolve the destination or open a direct socket before
+delegating a proxied connection. Proxy-side DNS/address-family selection is
+outside this preference, so IPv6 is not guaranteed through a proxy. Automatic
+system/environment proxy support starts with `websockets` 15; 14 retains its
+existing direct transport behavior. `prefer_ipv6=False` restores the installed
+transport's address selection, rather than forcing IPv4.
+
+To inspect the actual selected direct rendezvous TCP peer, enable just the
+transport logger at DEBUG (configure a logging handler as appropriate):
+
+```python
+import logging
+
+logging.getLogger("hybrid_connection._rendezvous").setLevel(logging.DEBUG)
+```
+
+It reports `IPv6` or `IPv4` and the peer address/port, not SAS tokens or the
+rendezvous URL. A proxied connection instead reports that address selection was
+delegated; the namespace control connection is not evidence of the rendezvous
+address family.
 
 #### Properties
 
@@ -362,6 +418,7 @@ hybrid-connection-python/
 │   └── hybrid_connection/
 │       ├── __init__.py              # Public API exports
 │       ├── listener.py              # HybridConnectionListener class
+│       ├── _rendezvous.py            # IPv6-first direct rendezvous transport
 │       ├── client.py                # HybridConnectionClient (sender)
 │       ├── stream.py                # HybridConnectionStream (rendezvous WebSocket)
 │       ├── token_provider.py        # SAS token generation
@@ -379,6 +436,9 @@ hybrid-connection-python/
 │   ├── test_reconnection.py                 # Reconnection tests
 │   ├── test_ping.py                         # Keepalive tests
 │   ├── test_rendezvous_protocol.py          # Rendezvous URL/parsing tests
+│   ├── test_rendezvous_transport.py         # Address selection and loopback socket tests
+│   ├── test_rendezvous_proxy.py             # Offline HTTP CONNECT proxy tests
+│   ├── test_listener_rendezvous.py          # Listener transport policy wiring tests
 │   ├── test_hybrid_connection_stream.py     # HybridConnectionStream tests
 │   ├── test_hybrid_connection_client.py     # HybridConnectionClient tests
 │   ├── test_accept_handler.py               # Accept-handler / reject tests

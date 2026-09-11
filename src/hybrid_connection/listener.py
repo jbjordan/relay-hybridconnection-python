@@ -8,6 +8,7 @@ from typing import Optional, Callable, Awaitable, Coroutine, Union, Any
 import websockets
 from websockets.exceptions import ConnectionClosed as _WSConnectionClosed
 
+from ._rendezvous import connect_rendezvous
 from .connection_string import RelayConnectionStringBuilder
 from .token_provider import TokenProvider, SecurityToken
 from .protocol import (
@@ -52,16 +53,26 @@ class HybridConnectionListener:
        as ``HybridConnectionStream`` instances.
     """
 
-    def __init__(self, address: str, token_provider: TokenProvider):
+    def __init__(
+        self,
+        address: str,
+        token_provider: TokenProvider,
+        *,
+        prefer_ipv6: bool = True,
+    ):
         """
         Initialize the HybridConnectionListener.
         
         Args:
             address: The hybrid connection URI (e.g., "sb://namespace.servicebus.windows.net/path")
             token_provider: TokenProvider instance for generating SAS tokens
+            prefer_ipv6: Prefer IPv6 for direct rendezvous connections, with
+                bounded IPv4 fallback. False retains legacy address selection.
+                Does not change control connections or proxy routing.
         """
         self._address = address
         self._token_provider = token_provider
+        self._prefer_ipv6 = prefer_ipv6
         self._websocket: Optional[Any] = None
         self._is_online = False
         self._protocol_handler = ProtocolHandler()
@@ -110,13 +121,17 @@ class HybridConnectionListener:
         self.accept_handler: Optional[AcceptHandler] = None
 
     @classmethod
-    def from_connection_string(cls, connection_string: str) -> "HybridConnectionListener":
+    def from_connection_string(
+        cls, connection_string: str, *, prefer_ipv6: bool = True
+    ) -> "HybridConnectionListener":
         """
         Create a HybridConnectionListener from a connection string.
         
         Args:
             connection_string: Azure Relay connection string containing Endpoint,
                              SharedAccessKeyName, SharedAccessKey, and EntityPath
+            prefer_ipv6: Prefer IPv6 for direct rendezvous connections with
+                IPv4 fallback. Defaults to True; False retains legacy selection.
         
         Returns:
             A new HybridConnectionListener instance
@@ -142,7 +157,7 @@ class HybridConnectionListener:
         # Build the address (sb:// URI format)
         address = builder.build_uri()
         
-        return cls(address, token_provider)
+        return cls(address, token_provider, prefer_ipv6=prefer_ipv6)
 
     @property
     def is_online(self) -> bool:
@@ -530,7 +545,9 @@ class HybridConnectionListener:
             return
 
         try:
-            websocket = await websockets.connect(url, max_size=None)
+            websocket = await connect_rendezvous(
+                url, prefer_ipv6=self._prefer_ipv6, max_size=None
+            )
         except Exception:
             logger.exception("Failed to open rendezvous request WebSocket")
             return
@@ -714,7 +731,9 @@ class HybridConnectionListener:
         if self._closed:
             raise ConnectionError("Cannot upgrade response: listener is closed")
         url = self._protocol_handler.build_rendezvous_request_url(rendezvous_address)
-        websocket = await websockets.connect(url, max_size=None)
+        websocket = await connect_rendezvous(
+            url, prefer_ipv6=self._prefer_ipv6, max_size=None
+        )
         stream = HybridConnectionStream(websocket, address=url)
         if self._closed:
             await stream.close()
@@ -804,7 +823,7 @@ class HybridConnectionListener:
     ) -> None:
         try:
             url = self._protocol_handler.build_rendezvous_accept_url(address)
-            websocket = await websockets.connect(url)
+            websocket = await connect_rendezvous(url, prefer_ipv6=self._prefer_ipv6)
         except Exception:
             logger.exception("Failed to open rendezvous accept WebSocket")
             return
@@ -846,7 +865,7 @@ class HybridConnectionListener:
             # successful path; any other failure is logged at WARNING for
             # diagnosability. If for some reason the WebSocket succeeds
             # we still close it (the rejection has already taken effect).
-            ws = await websockets.connect(url)
+            ws = await connect_rendezvous(url, prefer_ipv6=self._prefer_ipv6)
         except Exception as exc:
             message = str(exc)
             if "410" in message:

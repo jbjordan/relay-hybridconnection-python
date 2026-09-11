@@ -67,7 +67,7 @@ class TestAcceptHandlerDefault:
         accepted_ws.close = AsyncMock()
 
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(return_value=accepted_ws),
         ) as connect:
             await listener._handle_accept(
@@ -105,7 +105,7 @@ class TestAcceptHandlerCustom:
 
         accepted_ws = MagicMock()
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(return_value=accepted_ws),
         ):
             await listener._handle_accept(
@@ -130,7 +130,7 @@ class TestAcceptHandlerCustom:
         listener.accept_handler = handler
 
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(return_value=MagicMock()),
         ):
             await listener._handle_accept(
@@ -164,7 +164,7 @@ class TestAcceptHandlerReject:
         websocket = MagicMock()
         websocket.close = AsyncMock()
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(return_value=websocket),
         ) as connect:
             try:
@@ -190,7 +190,7 @@ class TestAcceptHandlerReject:
         # The reject connect attempt is expected to fail (HTTP 410 is the
         # successful rejection signal); ensure we tolerate it.
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(side_effect=Exception("HTTP 410 Gone (expected reject)")),
         ) as connect:
             await listener._handle_accept(
@@ -220,7 +220,7 @@ class TestAcceptHandlerReject:
         listener.accept_handler = handler
 
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(side_effect=Exception("expected reject")),
         ) as connect:
             await listener._handle_accept(
@@ -246,7 +246,7 @@ class TestAcceptHandlerReject:
         listener.accept_handler = handler
 
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(side_effect=Exception("expected reject")),
         ) as connect:
             await listener._handle_accept(
@@ -270,7 +270,7 @@ class TestAcceptConnectionApi:
 
         accepted_ws = MagicMock()
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(return_value=accepted_ws),
         ):
             await listener._handle_accept(
@@ -295,7 +295,7 @@ class TestAcceptConnectionApi:
         ws_a = MagicMock()
         ws_b = MagicMock()
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(side_effect=[ws_a, ws_b]),
         ):
             await listener._handle_accept(
@@ -336,7 +336,7 @@ class TestReceiveLoopDispatch:
 
         accepted_ws = MagicMock()
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(return_value=accepted_ws),
         ):
             task = asyncio.create_task(listener._receive_loop())

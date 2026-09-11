@@ -595,11 +595,14 @@ async def test_close_before_dispatch_starts_closes_its_coroutine(listener):
 @pytest.mark.asyncio
 async def test_listener_close_keeps_handed_off_stream_open(listener):
     websocket = _idle_websocket()
-    with patch("websockets.connect", new=AsyncMock(return_value=websocket)):
+    with patch(
+        "hybrid_connection.listener.connect_rendezvous",
+        new=AsyncMock(return_value=websocket),
+    ):
         await listener._handle_accept(
             {"address": "wss://dc/p?sb-hc-action=accept", "id": "owned-by-caller"}
         )
-    stream = await listener.accept_connection()
+    stream = await asyncio.wait_for(listener.accept_connection(), timeout=1)
     try:
         await listener.close()
         websocket.close.assert_not_awaited()

@@ -144,7 +144,7 @@ class TestSmallRequestLargeResponse:
         rendezvous_ws.recv = AsyncMock(side_effect=ConnectionClosedOK(None, None))
 
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(return_value=rendezvous_ws),
         ) as connect:
             await listener._handle_control_request(
@@ -377,7 +377,7 @@ class TestRendezvousRequestPointer:
         )
 
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(return_value=rendezvous_ws),
         ):
             await listener._handle_rendezvous_request(
@@ -415,7 +415,7 @@ class TestControlChannelLimitBoundary:
         listener.request_handler = handler
 
         with patch(
-            "src.hybrid_connection.listener.websockets.connect",
+            "src.hybrid_connection.listener.connect_rendezvous",
             new=AsyncMock(),
         ) as connect:
             await listener._handle_control_request(
@@ -554,7 +554,7 @@ async def test_response_upgrade_serves_followup_requests():
         ]
     )
     with patch(
-        "src.hybrid_connection.listener.websockets.connect",
+        "src.hybrid_connection.listener.connect_rendezvous",
         new=AsyncMock(return_value=rendezvous),
     ):
         await listener._handle_control_request(
@@ -593,7 +593,7 @@ async def test_response_close_does_not_wait_for_rendezvous_peer():
 
     listener.request_handler = handler
     with patch(
-        "src.hybrid_connection.listener.websockets.connect",
+        "src.hybrid_connection.listener.connect_rendezvous",
         new=AsyncMock(return_value=rendezvous),
     ):
         try:
