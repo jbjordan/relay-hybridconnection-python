@@ -22,6 +22,9 @@ from src.hybrid_connection.protocol import (
 )
 
 
+TRACKING_ID = "42dba40e-6483-4f5f-872c-de300b4fbc9b"
+
+
 class TestBuildRendezvousAcceptUrl:
     def test_accepts_ws_url_unchanged(self):
         address = "wss://ns.servicebus.windows.net:443/$hc/path?sb-hc-action=accept&sb-hc-id=abc"
@@ -85,7 +88,7 @@ class TestBuildSenderConnectUrl:
             "contoso.servicebus.windows.net",
             "hc1/suffix?app=one%20two&empty=",
             token="token",
-            hc_id="diag-1",
+            hc_id=TRACKING_ID,
         )
         parsed = urlsplit(url)
         assert parsed.path == "/$hc/hc1/suffix"
@@ -93,7 +96,7 @@ class TestBuildSenderConnectUrl:
             "app": ["one two"],
             "empty": [""],
             "sb-hc-action": ["connect"],
-            "sb-hc-id": ["diag-1"],
+            "sb-hc-id": [TRACKING_ID],
             "sb-hc-token": ["token"],
         }
 
@@ -124,9 +127,9 @@ class TestBuildSenderConnectUrl:
         url = ProtocolHandler.build_sender_connect_url(
             namespace="contoso.servicebus.windows.net",
             path="hc1",
-            hc_id="diag-1234",
+            hc_id=TRACKING_ID,
         )
-        assert "sb-hc-id=diag-1234" in url
+        assert f"sb-hc-id={TRACKING_ID}" in url
 
     def test_rejects_empty_namespace_or_path(self):
         with pytest.raises(ValueError):

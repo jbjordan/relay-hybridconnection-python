@@ -432,8 +432,9 @@ class ProtocolHandler:
             token: Optional SAS token for authentication. If omitted, the
                 Hybrid Connection must be configured to allow anonymous
                 senders.
-            hc_id: Optional client-supplied ID for end-to-end diagnostic
+            hc_id: Optional client-supplied UUID for end-to-end diagnostic
                 tracing; flows to the listener via the accept message.
+                Use a fresh UUID string, not an arbitrary label.
 
         Returns:
             The complete WebSocket URL for the sender to connect to.

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import websockets
 
 from src.hybrid_connection.listener import HybridConnectionListener
 from src.hybrid_connection.token_provider import TokenProvider
@@ -61,6 +62,45 @@ ACCEPT_MESSAGE = json.dumps({
 
 class TestAcceptHandlerDefault:
     @pytest.mark.asyncio
+    async def test_rendezvous_accept_does_not_offer_client_compression(self):
+        request = asyncio.get_running_loop().create_future()
+
+        async def echo(websocket):
+            request.set_result(websocket.request)
+            async for message in websocket:
+                await websocket.send(message)
+
+        listener = _build_listener()
+        async with websockets.serve(
+            echo, "127.0.0.1", 0, compression=None
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            try:
+                await listener._handle_accept(
+                    {
+                        "address": f"ws://127.0.0.1:{port}/?sb-hc-action=accept",
+                        "id": "id-1",
+                        "connect_headers": {
+                            "Sec-WebSocket-Extensions": (
+                                "permessage-deflate; client_max_window_bits"
+                            ),
+                        },
+                    }
+                )
+                stream = await asyncio.wait_for(listener.accept_connection(), timeout=1)
+                try:
+                    received_request = await asyncio.wait_for(request, timeout=1)
+                    assert "Sec-WebSocket-Extensions" not in received_request.headers
+                    await stream.send_text("hello")
+                    assert await asyncio.wait_for(stream.receive(), timeout=1) == (
+                        "hello", "text"
+                    )
+                finally:
+                    await stream.close()
+            finally:
+                await listener.close()
+
+    @pytest.mark.asyncio
     async def test_default_accept_handler_accepts_connection(self):
         listener = _build_listener()
         accepted_ws = MagicMock()
@@ -84,6 +124,7 @@ class TestAcceptHandlerDefault:
         url = connect.call_args.args[0]
         assert "sb-hc-action=accept" in url
         assert "sb-hc-statusCode" not in url
+        assert connect.call_args.kwargs["compression"] is None
 
         # Stream should be queued for accept_connection().
         assert listener._pending_connections.qsize() == 1

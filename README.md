@@ -122,13 +122,14 @@ asyncio.run(main())
 
 ```python
 import asyncio
+from uuid import uuid4
 from hybrid_connection import HybridConnectionClient
 
 async def main():
     client = HybridConnectionClient.from_connection_string(CONNECTION_STRING)
     stream = await client.create_connection(
         request_headers={"X-MyApp": "ok"},
-        hc_id="diagnostic-id-1",
+        hc_id=str(uuid4()),
     )
     try:
         await stream.send_text("hello")
@@ -185,13 +186,15 @@ If `listener.close()` is cancelled, await it again to finish shutdown before reo
 Sender-side counterpart that opens rendezvous WebSocket connections to a listener.
 
 ```python
+from uuid import uuid4
+
 client = HybridConnectionClient.from_connection_string(CONNECTION_STRING)
 # or anonymous:
 client = HybridConnectionClient("sb://<namespace>.servicebus.windows.net/<path>")
 
 stream = await client.create_connection(
     request_headers={"X-MyApp": "..."},
-    hc_id="optional-diagnostic-id",
+    hc_id=str(uuid4()),
 )
 ```
 
@@ -199,6 +202,10 @@ stream = await client.create_connection(
 
 - **`from_connection_string(conn_str)`** (classmethod): Build a client from a connection string (no `SharedAccessKey*` ⇒ anonymous sender)
 - **`async create_connection(request_headers=None, *, hc_id=None) -> HybridConnectionStream`**: Open a rendezvous WebSocket to a listener; `request_headers` are surfaced to the listener via the accept message's `connectHeaders`
+
+Omit `hc_id` to let Azure Relay generate an ID, or supply a fresh UUID string
+such as `str(uuid4())`. Arbitrary labels such as `"sender-1"` can prevent the
+service from correlating the rendezvous connection.
 
 ### HybridConnectionStream
 
@@ -434,6 +441,7 @@ This implementation supports:
 - Multiple listeners on the same Hybrid Connection (load balancing) is supported by the service but this client does not implement coordinated draining/leasing across listener instances; each listener simply registers and the service distributes work.
 - HTTP bodies are buffered in memory rather than streamed. Very large payloads (multi-MB) should be transferred via the WebSocket rendezvous if streaming is desired.
 - Duplex WebSocket streams retain the `websockets` default 1 MiB incoming-message limit; split larger transfers into multiple messages. HTTP rendezvous bodies are not subject to that limit.
+- Accepted duplex WebSocket streams do not negotiate compression. The listener declines extensions rather than forwarding a client compression offer as an invalid server response.
 
 ## Configuration
 

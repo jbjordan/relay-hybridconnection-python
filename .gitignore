@@ -42,3 +42,6 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Local sample workspace (not part of the published samples)
+samples/streaming/

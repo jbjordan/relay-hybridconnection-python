@@ -4,6 +4,7 @@ import secrets
 import string
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import pytest
 
@@ -141,13 +142,14 @@ class TestCreateConnection:
     @pytest.mark.asyncio
     async def test_create_connection_includes_hc_id(self):
         client = HybridConnectionClient("sb://contoso.servicebus.windows.net/hc1")
+        tracking_id = str(uuid4())
 
         with patch(
             "src.hybrid_connection.client.websockets.connect",
             new=AsyncMock(return_value=MagicMock()),
         ) as connect:
-            stream = await client.create_connection(hc_id="diag-42")
+            stream = await client.create_connection(hc_id=tracking_id)
 
         url = connect.call_args.args[0]
-        assert "sb-hc-id=diag-42" in url
-        assert stream.tracking_id == "diag-42"
+        assert f"sb-hc-id={tracking_id}" in url
+        assert stream.tracking_id == tracking_id

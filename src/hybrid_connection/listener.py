@@ -804,7 +804,9 @@ class HybridConnectionListener:
     ) -> None:
         try:
             url = self._protocol_handler.build_rendezvous_accept_url(address)
-            websocket = await websockets.connect(url)
+            # Relay forwards these extension headers as the sender's server response.
+            # A client compression offer isn't a valid server negotiation response.
+            websocket = await websockets.connect(url, compression=None)
         except Exception:
             logger.exception("Failed to open rendezvous accept WebSocket")
             return

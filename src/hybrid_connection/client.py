@@ -93,7 +93,9 @@ class HybridConnectionClient:
             request_headers: Optional HTTP headers to send with the
                 WebSocket upgrade. These are surfaced to the listener via
                 the ``connectHeaders`` field of the accept message.
-            hc_id: Optional client-supplied id for end-to-end diagnostics.
+            hc_id: Optional client-supplied UUID for end-to-end diagnostics.
+                Use a fresh UUID string for each connection, or omit it to
+                let the service generate an ID.
 
         Returns:
             A ``HybridConnectionStream`` whose underlying WebSocket is

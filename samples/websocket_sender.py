@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 # Add the src directory to the path so we can import hybrid_connection.
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -38,7 +39,7 @@ async def main() -> None:
 
     stream = await client.create_connection(
         request_headers={"X-MyApp": "websocket-sender-sample"},
-        hc_id="sender-1",
+        hc_id=str(uuid4()),
     )
     print(f"Connected (id={stream.tracking_id})")
 
