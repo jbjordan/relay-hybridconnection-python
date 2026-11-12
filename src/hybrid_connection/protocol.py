@@ -11,6 +11,7 @@ This module handles the low-level protocol operations including:
 """
 
 import json
+import re
 from typing import Dict, Optional, Any, Tuple
 from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -18,6 +19,36 @@ from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 # Per-message size cap that triggers a rendezvous upgrade for HTTP messages
 # (matches the Azure Relay service limit for control-channel messages).
 CONTROL_CHANNEL_MAX_BODY_SIZE = 64 * 1024
+MAX_HEADER_SIZE = 32 * 1024
+HOP_BY_HOP_HEADERS = {
+    "connection", "content-length", "host", "te", "trailer",
+    "transfer-encoding", "upgrade", "close", "keep-alive", "proxy-connection",
+}
+
+
+def validate_headers(headers, *, http_response=False):
+    size = 0
+    for name, value in headers.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise ValueError("Invalid HTTP header name")
+        if not isinstance(value, str) or any(
+            (ord(c) < 32 and c != "\t") or ord(c) == 127 for c in value
+        ):
+            raise ValueError(f"Invalid HTTP header value: {name}")
+        if http_response and name.lower() in HOP_BY_HOP_HEADERS:
+            raise ValueError(f"Relay HTTP response cannot include {name}")
+        size += len(name.encode("utf-8")) + len(value.encode("utf-8")) + 4
+    if size > MAX_HEADER_SIZE:
+        raise ValueError("HTTP header metadata exceeds 32 KiB")
+
+
+def validate_status(code, description):
+    if isinstance(code, bool) or not isinstance(code, int) or not 100 <= code <= 599:
+        raise ValueError("HTTP status code must be an integer from 100 to 599")
+    if not isinstance(description, str) or any(
+        (ord(c) < 32 and c != "\t") or ord(c) >= 127 for c in description
+    ):
+        raise ValueError("Invalid HTTP status description")
 
 # Control-message kinds returned from parse_control_message.
 MESSAGE_KIND_ACCEPT = "accept"
@@ -49,7 +80,7 @@ class ProtocolHandler:
         return parsed.netloc, path
 
     @staticmethod
-    def build_control_channel_url(namespace: str, path: str, token: str) -> str:
+    def build_control_channel_url(namespace: str, path: str, token: str, hc_id=None) -> str:
         """
         Build the WebSocket URL for the control channel.
 
@@ -71,6 +102,8 @@ class ProtocolHandler:
             f"sb-hc-action=listen&sb-hc-token={encoded_token}"
         )
         
+        if hc_id:
+            url += "&sb-hc-id=" + quote(hc_id, safe="")
         return url
 
     @staticmethod
@@ -129,6 +162,7 @@ class ProtocolHandler:
             for key, value in headers.items()
         ):
             raise ValueError(f"'{name}' must be an object of string headers")
+        validate_headers(headers)
         return headers
 
     @staticmethod
@@ -151,6 +185,8 @@ class ProtocolHandler:
         for key in required:
             if not isinstance(request_data[key], str) or not request_data[key]:
                 raise ValueError(f"Request '{key}' must be a non-empty string")
+        if request_data["method"].upper() == "CONNECT":
+            raise ValueError("Relay does not support HTTP CONNECT")
         ProtocolHandler._headers(request_data, 'requestHeaders')
         if 'body' in request_data and not isinstance(request_data['body'], bool):
             raise ValueError("Request 'body' must be a boolean")
@@ -258,15 +294,24 @@ class ProtocolHandler:
             'statusCode': status_code,
             'statusDescription': status_description
         }
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("Response requestId must be a non-empty string")
+        validate_status(status_code, status_description)
+        if status_code in (502, 504):
+            raise ValueError("Relay reserves HTTP response statuses 502 and 504")
+        validate_headers(headers or {}, http_response=True)
 
         if headers:
-            response_data['responseHeaders'] = headers
+            response_data['responseHeaders'] = dict(headers)
 
         if has_body:
             response_data['body'] = True
 
         # Wrap in response object (matching Azure Relay protocol)
-        return json.dumps({'response': response_data})
+        message = json.dumps({'response': response_data}, ensure_ascii=False)
+        if len(message.encode("utf-8")) > MAX_HEADER_SIZE:
+            raise ValueError("Encoded response metadata exceeds 32 KiB")
+        return message
 
     @staticmethod
     def build_renew_token_message(token: str) -> str:
@@ -407,13 +452,25 @@ class ProtocolHandler:
                 f"Rendezvous address must use ws:// or wss://, got {parsed.scheme!r}"
             )
 
-        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
-        query_pairs.append(("sb-hc-statusCode", str(status_code)))
-        query_pairs.append(("sb-hc-statusDescription", status_description or ""))
-        new_query = urlencode(query_pairs)
-        return urlunsplit(
-            (parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment)
-        )
+        validate_status(status_code, status_description or "")
+        separator = "&" if parsed.query else "?"
+        return address + separator + urlencode({
+            "sb-hc-statusCode": status_code,
+            "sb-hc-statusDescription": status_description or "",
+        })
+
+    @staticmethod
+    def logical_accept_url(listener_address: str, rendezvous_address: str) -> str:
+        base = urlsplit(listener_address)
+        rendezvous = urlsplit(rendezvous_address)
+        path = rendezvous.path
+        if path.startswith("/$hc/"):
+            path = path[4:]
+        query = urlencode([
+            (key, value) for key, value in parse_qsl(rendezvous.query, keep_blank_values=True)
+            if not key.lower().startswith("sb-hc-")
+        ])
+        return urlunsplit((base.scheme, base.netloc, path, query, ""))
 
     @staticmethod
     def build_sender_connect_url(

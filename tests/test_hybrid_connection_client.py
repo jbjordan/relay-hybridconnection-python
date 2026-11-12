@@ -136,8 +136,8 @@ class TestCreateConnection:
         kwargs = connect.call_args.kwargs
         assert kwargs["additional_headers"] == {
             "X-MyApp": "v1",
-            "Sec-WebSocket-Protocol": "echo",
         }
+        assert kwargs["subprotocols"] == ["echo"]
 
     @pytest.mark.asyncio
     async def test_create_connection_includes_hc_id(self):

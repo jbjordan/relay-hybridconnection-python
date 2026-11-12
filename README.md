@@ -8,8 +8,10 @@ A Python implementation of the Azure Relay Hybrid Connection Protocol covering b
 - **WebSocket rendezvous pattern**: Accept full-duplex WebSocket connections from senders, with an optional accept handler for inspecting / rejecting senders
 - **Large request/response handling**: Automatically upgrades large HTTP requests and responses (>64 kB) to a dedicated rendezvous WebSocket
 - **Sender API (``HybridConnectionClient``)**: Open authenticated or anonymous WebSocket connections to a listener
-- **Automatic Reconnection**: Handles disconnections with exponential backoff
-- **Token Management**: Automatic SAS token renewal before expiration
+- **Automatic Reconnection**: Configurable backoff, jitter, retry budgets and terminal-error handling
+- **Token Management**: Key-based SAS renewal, preissued SAS, and async Azure Identity credentials
+- **Streaming and capacity controls**: Incremental HTTP bodies, bounded buffers and configurable listener capacity
+- **Diagnostics**: Typed Relay exceptions, tracking IDs and standard Python logging
 - **Keepalive/Ping**: Prevents NAT timeout with periodic ping messages
 - **Event Callbacks**: Monitor connection status with `on_connecting`, `on_online`, and `on_offline` events
 - **Async/Await Support**: Built on Python's asyncio for efficient concurrent operations
@@ -17,19 +19,23 @@ A Python implementation of the Azure Relay Hybrid Connection Protocol covering b
 ## Installation
 
 1. Clone or download this repository
-2. Install dependencies:
+2. Install the package (Python 3.11 or later):
 
 ```bash
-pip install -r requirements.txt
+pip install .
+
+# Development dependencies
+pip install -e ".[dev]"
+
+# Optional Azure Identity support
+pip install ".[identity]"
 ```
 
 ### Dependencies
 
-- `websockets>=14.0` - WebSocket client (uses the modern asyncio API)
-- `aiohttp>=3.9.0` - HTTP client for sender
-- `pytest>=8.0.0` - Testing framework
-- `pytest-asyncio>=0.23.0` - Async test support
-- `pytest-mock>=3.12.0` - Mocking support for tests
+- `websockets>=15.0,<17` - WebSocket transport
+- `aiohttp>=3.9.0,<4` - HTTP sender samples and runtime-information requests
+- Test/build dependencies are in the `dev` extra, not runtime requirements.
 
 ## Quick Start
 
@@ -203,7 +209,7 @@ stream = await client.create_connection(
 - **`from_connection_string(conn_str)`** (classmethod): Build a client from a connection string (no `SharedAccessKey*` ⇒ anonymous sender)
 - **`async create_connection(request_headers=None, *, hc_id=None) -> HybridConnectionStream`**: Open a rendezvous WebSocket to a listener; `request_headers` are surfaced to the listener via the accept message's `connectHeaders`
 
-Omit `hc_id` to let Azure Relay generate an ID, or supply a fresh UUID string
+Omit `hc_id` to let the SDK generate an ID, or supply a fresh UUID string
 such as `str(uuid4())`. Arbitrary labels such as `"sender-1"` can prevent the
 service from correlating the rendezvous connection.
 
@@ -215,7 +221,7 @@ The duplex WebSocket produced by a successful rendezvous. Returned by both `Hybr
 
 - **`tracking_id`** (str | None): The id supplied by the sender (or assigned by the service) for end-to-end diagnostics
 - **`connect_headers`** (dict): On the listener side, the headers the sender supplied with the WebSocket upgrade
-- **`address`** (str): The rendezvous URL the stream is connected to
+- **`address`** (str): The logical Relay address on sender streams; the rendezvous URL on listener streams. Never log raw rendezvous URLs.
 - **`is_closed`** (bool): Whether the stream has been closed
 
 #### Methods
@@ -225,6 +231,9 @@ The duplex WebSocket produced by a successful rendezvous. Returned by both `Hybr
 - **`async receive() -> (payload, "text" | "binary")`**
 - **`async for payload, kind in stream: ...`**: Ends on normal closure; raises `ConnectionError` on abnormal disconnection instead of silently truncating the transfer
 - **`async close(code=1000, reason="")`**: Close the stream; errors propagate, and failed or cancelled closes can be retried
+- **`async read(size=65536)` / `async write(data)`**: Incremental byte-stream reads and backpressured binary writes. Do not mix partially consumed byte-stream reads with `receive()`.
+- **`async shutdown()`**: Send WebSocket close-output without waiting for the peer. Buffered incoming data remains readable; subsequent writes are rejected. This is a WebSocket closing handshake, not TCP half-close.
+- **`abort()`**: Immediately release the underlying transport without a graceful handshake.
 
 ### RelayedHttpListenerContext
 
@@ -247,15 +256,17 @@ Represents an incoming HTTP request.
 - **`http_method`** (str): HTTP method (GET, POST, PUT, DELETE, etc.)
 - **`url`** (str): Request URL/path
 - **`headers`** (dict): HTTP request headers
-- **`input_stream`** (BinaryIO): Request body stream
+- **`input_stream`**: A `BytesIO` by default; an async reader for rendezvous bodies when `stream_requests=True`
 - **`has_entity_body`** (bool): Whether request has a body
-- **`content_length`** (int): Length of request body
+- **`content_length`** (int | None): Buffered body length, or `None` for an unread streaming body
 - **`content_type`** (str): Content-Type header value
 
 #### Methods
 
 - **`get_header(name)`**: Get header value (case-insensitive)
 - **`read_body()`**: Read entire request body as bytes
+- **`async read_body_async()`**: Buffer and return the remaining streaming body, subject to the body limit
+- **`async for chunk in iter_body(chunk_size=65536)`**: Process the body incrementally
 
 ### RelayedHttpListenerResponse
 
@@ -265,12 +276,14 @@ Represents an outgoing HTTP response.
 
 - **`status_code`** (int): HTTP status code (e.g., 200, 404)
 - **`status_description`** (str): Status reason phrase (e.g., "OK"). Setting to `None` clears it.
-- **`headers`** (dict): HTTP response headers
-- **`output_stream`** (BinaryIO): Response body stream
+- **`headers`**: Case-insensitive mutable mapping, frozen once sending starts
+- **`output_stream`**: Bounded response buffer with `write()`, `write_async()` and `flush_async()`
+- **`has_started` / `failure`**: Transmission state and any terminal send failure
 
 #### Methods
 
 - **`async close()`**: Finalizes and sends the response once. The listener also closes the response automatically when the request handler returns.
+- **`async flush()`**: Upgrade to rendezvous and transmit currently buffered data. After sending begins, status and headers cannot change. A failed close remains failed; subsequent closes re-raise the error rather than claiming success or replaying a partial response.
 
 ### TokenProvider
 
@@ -282,6 +295,167 @@ token_provider = TokenProvider(key_name="RootKey", shared_access_key="<your-key>
 # Get token for specific audience
 token = token_provider.get_token(audience="sb://namespace.servicebus.windows.net/path")
 ```
+
+## Streaming and operational configuration
+
+```python
+from hybrid_connection import (
+    HybridConnectionListener, ListenerLimits, RetryPolicy, TransportOptions,
+)
+
+listener = HybridConnectionListener.from_connection_string(
+    CONNECTION_STRING,
+    stream_requests=True,
+    subprotocols=["my-app-v1"],
+    transport=TransportOptions(
+        open_timeout=30, close_timeout=10,
+        read_timeout=None, write_timeout=60,
+        max_message_size=8 * 1024 * 1024,
+        proxy=None,  # Disable environment/system proxies; default True uses them.
+    ),
+    retry_policy=RetryPolicy(
+        initial_delay=1, max_delay=60, jitter=0.2,
+        max_attempts=20, max_elapsed=600,
+    ),
+    limits=ListenerLimits(
+        max_concurrent_requests=100, max_pending_connections=100,
+        max_http_body_size=64 * 1024 * 1024,
+        max_response_buffer_size=4 * 1024 * 1024,
+        request_timeout=55, body_timeout=60, accept_timeout=20,
+        response_flush_interval=2,
+    ),
+)
+
+async def handler(context):
+    context.response.headers["Content-Type"] = "application/octet-stream"
+    async for chunk in context.request.iter_body():
+        await context.response.output_stream.write_async(chunk)
+    await context.response.close()
+
+listener.request_handler = handler
+```
+
+By default, request bodies remain buffered for compatibility with synchronous
+`read_body()`. Enable `stream_requests=True` to receive rendezvous bodies before
+their final fragment. Control-channel bodies are always buffered, up to 64 KiB.
+All HTTP request bodies are bounded by `max_http_body_size`.
+
+Response writes initially buffer up to 64 KiB before switching to rendezvous;
+the flush timer also starts transmission after two seconds. Use `write_async()`
+for large bodies and transport backpressure, or explicitly `await response.flush()`
+for latency-sensitive small writes. Synchronous `write()` raises `BufferError`
+rather than exceeding `max_response_buffer_size`. `get_body()` returns only the
+currently buffered, unsent bytes after streaming starts. Do not seek or truncate
+the output buffer while a response is being transmitted.
+
+The initial handler deadline defaults to 55 seconds. Once streaming starts,
+successful writes extend the deadline by `body_timeout`; the protocol still
+requires response headers within 60 seconds and no body inactivity above 60
+seconds. Keep configured deadlines within those service limits. Handlers must
+not block the asyncio event loop; offload blocking work explicitly.
+
+Capacity counts include active rendezvous HTTP dispatch loops. Saturated
+listeners reject new work with 503 where a response can be sent. Excess accepted
+sockets are closed with 1013. Existing handed-off duplex streams remain owned
+by their callers, not the listener.
+
+`TransportOptions` also supports `ssl` (an SSL context), `websocket_factory`
+(a callable with the `websockets.connect` contract), `max_queue`, `ping_interval`
+and `ping_timeout`. The injected connection must implement the websockets 15/16
+asyncio interface; `shutdown()` uses its Sans-I/O close-output facilities.
+Set `max_message_size=None` only when the application can safely handle
+unlimited message sizes. HTTP body limits are independent of duplex limits.
+
+### Subprotocols and accept routing
+
+Senders use `await client.create_connection(subprotocols=["my-app-v1"])`.
+The listener chooses a matching configured subprotocol. An `accept_handler`
+can override it with `context.response.headers["Sec-WebSocket-Protocol"]`;
+the selection must have been offered by the sender. Unsupported offers are
+rejected. Legacy sender headers named `Sec-WebSocket-Protocol` are translated
+to the transport's subprotocol option.
+
+`context.request.url` in accept handlers includes the logical entity path,
+application suffix and query, with `sb-hc-` parameters removed. The service
+rendezvous URL remains separate as `context.rendezvous_address`.
+
+### Authentication
+
+Use `TokenProvider.from_sas_token(sas)` for a preissued SAS, or include
+`SharedAccessSignature=...` in the connection string. A fixed SAS cannot be
+extended without its signing key: obtain a replacement before it expires.
+
+Azure credentials are caller-owned async credentials:
+
+```python
+from azure.identity.aio import DefaultAzureCredential
+from hybrid_connection import HybridConnectionClient, TokenProvider
+
+async def connect_with_identity():
+    async with DefaultAzureCredential() as credential:
+        client = HybridConnectionClient(
+            "sb://namespace.servicebus.windows.net/entity",
+            TokenProvider.from_credential(credential),
+        )
+        stream = await client.create_connection()
+        try:
+            await stream.send_bytes(b"hello")
+        finally:
+            await stream.close()
+```
+
+`ManagedIdentityCredential` from `azure.identity.aio` is supported in the same
+way. Tokens use the `https://relay.azure.net/.default` scope. Connection strings
+with `Authentication=Managed Identity` require `credential=...` in
+`from_connection_string`; the SDK never silently substitutes anonymous auth.
+Connection-string keys are case-insensitive. Unknown, duplicate, empty and
+conflicting credential settings fail explicitly. `OperationTimeout` accepts
+positive seconds or `HH:MM:SS` and sets connection/write timeouts unless an
+explicit transport configuration is provided.
+
+### Diagnostics, errors and retries
+
+Enable the standard `hybrid_connection` logging hierarchy in your application's
+logging configuration. Records include fields such as `tracking_id`, `attempt`,
+`delay`, `close_code`, `status_code` and `size`, depending on the operation.
+The SDK does not configure the root logger or log payloads. Its diagnostics
+redact credential text; avoid enabling raw `websockets` DEBUG logs in production
+because handshake URLs and headers may contain credentials.
+
+Transport errors use `RelayError` (a `ConnectionError`) and specialized
+`AuthorizationError`, `EndpointNotFoundError`, `ServerBusyError`,
+`RelayTimeoutError` and `ProtocolError` subclasses. Errors expose
+`is_transient`, `status_code`, `close_code` and `tracking_id` where available,
+with the original exception chained as the cause. Do not log raw chained
+exceptions without credential redaction.
+
+`listener.last_error` retains the last connection failure and clears on
+successful reconnection. `on_offline` retains its existing meaning of a
+disconnect or connection failure; `on_stopped` signals shutdown or terminal
+retry exhaustion. After a terminal failure, await `close()` before reopening.
+Listener reconnection stops on authorization/not-found failures or exhausted
+budgets. Defaults retry transient failures indefinitely, with jitter.
+
+Initial `open()` and sender `create_connection()` remain single attempts.
+Established streams and HTTP requests are never automatically replayed:
+application retry policies must account for idempotency and ambiguous delivery.
+
+### Runtime information
+
+Both clients and listeners expose `await get_runtime_information()`. The
+returned `HybridConnectionRuntimeInformation` contains `created_at`,
+`updated_at`, `requires_client_authorization`, `user_metadata` and
+`listener_count`. Authentication is required; the operation uses the Relay
+data-plane management endpoint, not Azure Resource Manager.
+
+### Compatibility notes
+
+Version 0.3 requires Python 3.11+. Existing small buffered request/response
+handlers remain supported. Invalid response headers (including `Content-Length`
+and hop-by-hop headers), reserved HTTP statuses 502/504, and oversized metadata
+now fail before transmission. Response headers freeze once transmission starts.
+Network errors are normalized to Relay exceptions rather than leaking transport
+exception types. Response-send failures are terminal, not retried.
 
 ## Running the Samples
 
@@ -333,6 +507,7 @@ enabled. Set `SKIP_INTEGRATION=1` (or `true`) to disable them explicitly.
 ### Run All Tests
 
 ```bash
+pip install -e ".[dev]"
 pytest
 ```
 
@@ -439,8 +614,8 @@ This implementation supports:
 ### Known Limitations
 
 - Multiple listeners on the same Hybrid Connection (load balancing) is supported by the service but this client does not implement coordinated draining/leasing across listener instances; each listener simply registers and the service distributes work.
-- HTTP bodies are buffered in memory rather than streamed. Very large payloads (multi-MB) should be transferred via the WebSocket rendezvous if streaming is desired.
-- Duplex WebSocket streams retain the `websockets` default 1 MiB incoming-message limit; split larger transfers into multiple messages. HTTP rendezvous bodies are not subject to that limit.
+- HTTP request streaming is opt-in (`stream_requests=True`) to preserve existing synchronous body-reading APIs.
+- Duplex WebSocket streams default to a 1 MiB incoming-message limit; configure `TransportOptions.max_message_size` or split transfers into messages. HTTP requests have a separate configurable 64 MiB limit by default.
 - Accepted duplex WebSocket streams do not negotiate compression. The listener declines extensions rather than forwarding a client compression offer as an invalid server response.
 
 ## Configuration

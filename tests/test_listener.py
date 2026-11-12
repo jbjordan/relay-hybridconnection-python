@@ -402,6 +402,7 @@ class TestHybridConnectionListenerClose:
             mock_ws.recv = AsyncMock(side_effect=['{"type": "accept"}', asyncio.CancelledError()])
             mock_ws.ping = AsyncMock(side_effect=asyncio.CancelledError())
             mock_ws.close = AsyncMock(side_effect=Exception("Close failed"))
+            mock_ws.transport.abort = Mock()
             mock_connect.return_value = mock_ws
             
             await listener.open()

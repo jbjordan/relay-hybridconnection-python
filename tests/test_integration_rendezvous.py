@@ -191,8 +191,8 @@ def _make_client(fake_relay: FakeRelay) -> HybridConnectionClient:
     # Patch the protocol URL builder to use ws:// for loopback.
     original = client._build_connect_url
 
-    def _ws(*, hc_id=None):
-        url = original(hc_id=hc_id)
+    def _ws(*, hc_id=None, token=None):
+        url = original(hc_id=hc_id, token=token)
         return url.replace("wss://", "ws://", 1)
 
     client._build_connect_url = _ws  # type: ignore[assignment]

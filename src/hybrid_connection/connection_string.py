@@ -2,6 +2,7 @@
 
 from typing import Dict, Optional
 from urllib.parse import urlparse
+import math
 
 
 class RelayConnectionStringBuilder:
@@ -27,6 +28,9 @@ class RelayConnectionStringBuilder:
         self._shared_access_key_name: Optional[str] = None
         self._shared_access_key: Optional[str] = None
         self._entity_path: Optional[str] = None
+        self.shared_access_signature: Optional[str] = None
+        self.authentication: Optional[str] = None
+        self.operation_timeout: Optional[float] = None
 
         if connection_string is not None:
             self._parse(connection_string)
@@ -64,6 +68,33 @@ class RelayConnectionStringBuilder:
         self._shared_access_key_name = parts.get(self.SHARED_ACCESS_KEY_NAME_KEY)
         self._shared_access_key = parts.get(self.SHARED_ACCESS_KEY_KEY)
         self._entity_path = parts.get(self.ENTITY_PATH_KEY)
+        self.shared_access_signature = parts.get("SharedAccessSignature")
+        self.authentication = parts.get("Authentication")
+        if self.authentication and self.authentication.lower() != "managed identity":
+            raise ValueError("Authentication must be Managed Identity")
+        modes = sum((bool(self._shared_access_key), bool(self.shared_access_signature),
+                     bool(self.authentication)))
+        if modes > 1:
+            raise ValueError("Specify only one authentication method")
+        if "OperationTimeout" in parts:
+            try:
+                value = parts["OperationTimeout"]
+                components = value.split(":")
+                if len(components) not in (1, 3):
+                    raise ValueError()
+                if len(components) == 3 and not (
+                    int(components[0]) >= 0 and 0 <= int(components[1]) < 60
+                    and 0 <= float(components[2]) < 60
+                ):
+                    raise ValueError()
+                self.operation_timeout = (
+                    float(value) if len(components) == 1 else
+                    int(components[0]) * 3600 + int(components[1]) * 60 + float(components[2])
+                )
+                if not math.isfinite(self.operation_timeout) or self.operation_timeout <= 0:
+                    raise ValueError()
+            except (ValueError, IndexError) as exc:
+                raise ValueError("OperationTimeout must be positive seconds or HH:MM:SS") from exc
 
         # Validate endpoint format
         if self._endpoint:
@@ -79,6 +110,11 @@ class RelayConnectionStringBuilder:
             Dictionary of key-value pairs.
         """
         result = {}
+        names = {name.lower(): name for name in (
+            self.ENDPOINT_KEY, self.ENTITY_PATH_KEY, self.SHARED_ACCESS_KEY_KEY,
+            self.SHARED_ACCESS_KEY_NAME_KEY, "SharedAccessSignature",
+            "Authentication", "OperationTimeout",
+        )}
         parts = connection_string.split(";")
 
         for part in parts:
@@ -89,13 +125,19 @@ class RelayConnectionStringBuilder:
             # Find the first '=' to split key and value
             eq_index = part.find("=")
             if eq_index == -1:
-                continue
+                raise ValueError("Connection string component is missing '='")
 
             key = part[:eq_index].strip()
             value = part[eq_index + 1:].strip()
 
-            if key and value:
-                result[key] = value
+            canonical = names.get(key.lower())
+            if canonical is None:
+                raise ValueError(f"Unknown connection string field: {key}")
+            if not value:
+                raise ValueError(f"Connection string field cannot be empty: {canonical}")
+            if canonical in result:
+                raise ValueError(f"Duplicate connection string field: {canonical}")
+            result[canonical] = value
 
         return result
 
@@ -111,6 +153,26 @@ class RelayConnectionStringBuilder:
         parsed = urlparse(endpoint)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError(f"Invalid endpoint URL: {endpoint}")
+        if (parsed.scheme not in ("sb", "https", "http") or parsed.username
+                or parsed.password or parsed.query or parsed.fragment):
+            raise ValueError("Invalid Relay endpoint")
+
+    def create_token_provider(self, credential=None):
+        from .token_provider import TokenProvider, SasTokenProvider
+        if credential is not None:
+            if self.shared_access_signature or self.shared_access_key:
+                raise ValueError("Do not combine an Azure credential with SAS authentication")
+            return TokenProvider.from_credential(credential)
+        if self.shared_access_signature:
+            return SasTokenProvider(self.shared_access_signature)
+        if self.authentication:
+            raise ValueError(
+                "Managed Identity requires an explicitly supplied async credential: "
+                "use TokenProvider.from_credential(azure.identity.aio.ManagedIdentityCredential())"
+            )
+        if self.shared_access_key_name and self.shared_access_key:
+            return TokenProvider(self.shared_access_key_name, self.shared_access_key)
+        return None
 
     @property
     def endpoint(self) -> Optional[str]:
@@ -198,6 +260,9 @@ class RelayConnectionStringBuilder:
             raise ValueError("SharedAccessKey is required when SharedAccessKeyName is specified")
         if self._shared_access_key and not self._shared_access_key_name:
             raise ValueError("SharedAccessKeyName is required when SharedAccessKey is specified")
+        if sum((bool(self._shared_access_key), bool(self.shared_access_signature),
+                bool(self.authentication))) > 1:
+            raise ValueError("Specify only one authentication method")
 
         parts = []
 
@@ -209,5 +274,11 @@ class RelayConnectionStringBuilder:
             parts.append(f"{self.SHARED_ACCESS_KEY_KEY}={self._shared_access_key}")
         if self._entity_path:
             parts.append(f"{self.ENTITY_PATH_KEY}={self._entity_path}")
+        if self.shared_access_signature:
+            parts.append(f"SharedAccessSignature={self.shared_access_signature}")
+        if self.authentication:
+            parts.append(f"Authentication={self.authentication}")
+        if self.operation_timeout is not None:
+            parts.append(f"OperationTimeout={self.operation_timeout}")
 
         return ";".join(parts)

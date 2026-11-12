@@ -210,7 +210,6 @@ class TestBuildResponseMessage:
         """Test building a response with headers."""
         headers = {
             "Content-Type": "text/html",
-            "Content-Length": "1234",
             "X-Custom-Header": "value"
         }
 

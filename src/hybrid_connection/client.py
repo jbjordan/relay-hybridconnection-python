@@ -10,13 +10,21 @@ WebSocket is joined end-to-end between sender and listener.
 from __future__ import annotations
 
 from typing import Dict, Optional, Mapping
+import asyncio
+import logging
+from uuid import uuid4
 
 import websockets
 
 from .connection_string import RelayConnectionStringBuilder
-from .protocol import ProtocolHandler
+from .protocol import ProtocolHandler, validate_headers
 from .stream import HybridConnectionStream
-from .token_provider import TokenProvider
+from .token_provider import TokenProvider, acquire_token
+from .options import TransportOptions
+from .errors import relay_error
+from .runtime import get_runtime_information
+
+logger = logging.getLogger(__name__)
 
 
 class HybridConnectionClient:
@@ -30,6 +38,8 @@ class HybridConnectionClient:
         self,
         address: str,
         token_provider: Optional[TokenProvider] = None,
+        *,
+        transport: Optional[TransportOptions] = None,
     ) -> None:
         """Construct a new client.
 
@@ -44,9 +54,10 @@ class HybridConnectionClient:
             raise ValueError("address cannot be empty")
         self._address = address
         self._token_provider = token_provider
+        self.transport = transport or TransportOptions()
 
     @classmethod
-    def from_connection_string(cls, connection_string: str) -> "HybridConnectionClient":
+    def from_connection_string(cls, connection_string: str, *, transport=None, credential=None) -> "HybridConnectionClient":
         """Create a client from an Azure Relay connection string.
 
         The connection string must include ``EntityPath`` and (if anonymous
@@ -63,15 +74,13 @@ class HybridConnectionClient:
         if not builder.entity_path:
             raise ValueError("Connection string missing EntityPath")
 
-        token_provider: Optional[TokenProvider] = None
-        if builder.shared_access_key_name and builder.shared_access_key:
-            token_provider = TokenProvider(
-                key_name=builder.shared_access_key_name,
-                shared_access_key=builder.shared_access_key,
-            )
+        token_provider = builder.create_token_provider(credential)
+        if transport is None and builder.operation_timeout is not None:
+            transport = TransportOptions(open_timeout=builder.operation_timeout,
+                                         write_timeout=builder.operation_timeout)
 
         address = builder.build_uri()
-        return cls(address, token_provider)
+        return cls(address, token_provider, transport=transport)
 
     @property
     def address(self) -> str:
@@ -86,6 +95,7 @@ class HybridConnectionClient:
         request_headers: Optional[Mapping[str, str]] = None,
         *,
         hc_id: Optional[str] = None,
+        subprotocols: Optional[list[str]] = None,
     ) -> HybridConnectionStream:
         """Open a rendezvous WebSocket to a listener.
 
@@ -95,32 +105,57 @@ class HybridConnectionClient:
                 the ``connectHeaders`` field of the accept message.
             hc_id: Optional client-supplied UUID for end-to-end diagnostics.
                 Use a fresh UUID string for each connection, or omit it to
-                let the service generate an ID.
+                let the SDK generate a fresh UUID.
 
         Returns:
             A ``HybridConnectionStream`` whose underlying WebSocket is
             connected end-to-end to a listener that accepted the
             connection.
         """
-        url = self._build_connect_url(hc_id=hc_id)
+        hc_id = hc_id or str(uuid4())
         additional_headers: Optional[Dict[str, str]] = (
             dict(request_headers) if request_headers else None
         )
-        websocket = await websockets.connect(
-            url,
-            additional_headers=additional_headers,
-        )
+        if additional_headers:
+            validate_headers(additional_headers)
+            for name in list(additional_headers):
+                if name.lower() == "sec-websocket-protocol":
+                    if subprotocols is not None:
+                        raise ValueError("Specify subprotocols only once")
+                    subprotocols = [p.strip() for p in additional_headers.pop(name).split(",")]
+        logger.info("Connecting sender", extra={"tracking_id": hc_id})
+        try:
+            async with asyncio.timeout(self.transport.open_timeout):
+                token = (
+                    await acquire_token(self._token_provider, self._address)
+                    if self._token_provider is not None else None
+                )
+                url = self._build_connect_url(hc_id=hc_id, token=token.token if token else None)
+                websocket = await self.transport.connect(
+                    url, default_factory=websockets.connect,
+                    additional_headers=additional_headers, subprotocols=subprotocols,
+                )
+        except Exception as exc:
+            error = relay_error(exc, tracking_id=hc_id)
+            logger.warning("Sender connection failed: %s", error, extra={"tracking_id": hc_id})
+            if error is exc:
+                raise
+            raise error from exc
+        logger.info("Sender connected", extra={"tracking_id": hc_id})
         return HybridConnectionStream(
             websocket,
             tracking_id=hc_id,
             connect_headers=additional_headers,
-            address=url,
+            address=self._address,
+            transport=self.transport,
         )
 
-    def _build_connect_url(self, *, hc_id: Optional[str] = None) -> str:
+    async def get_runtime_information(self):
+        return await get_runtime_information(self._address, self._token_provider, self.transport)
+
+    def _build_connect_url(self, *, hc_id: Optional[str] = None, token: Optional[str] = None) -> str:
         namespace, path = _split_address(self._address)
-        token: Optional[str] = None
-        if self._token_provider is not None:
+        if token is None and self._token_provider is not None:
             token = self._token_provider.get_token(self._address).token
         return ProtocolHandler.build_sender_connect_url(
             namespace=namespace, path=path, token=token, hc_id=hc_id

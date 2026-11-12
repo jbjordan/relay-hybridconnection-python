@@ -4,12 +4,18 @@ import asyncio
 import inspect
 import logging
 from contextvars import ContextVar
+from uuid import uuid4
+from urllib.parse import quote
 from typing import Optional, Callable, Awaitable, Coroutine, Union, Any
 import websockets
 from websockets.exceptions import ConnectionClosed as _WSConnectionClosed
 
 from .connection_string import RelayConnectionStringBuilder
-from .token_provider import TokenProvider, SecurityToken
+from .token_provider import TokenProvider, SecurityToken, acquire_token
+from .options import TransportOptions, RetryPolicy, ListenerLimits
+from .errors import RelayError, ServerBusyError, relay_error, redact
+from .runtime import get_runtime_information
+from .http_stream import RequestBody, ResponseWriter
 from .protocol import (
     ProtocolHandler,
     MESSAGE_KIND_ACCEPT,
@@ -52,7 +58,9 @@ class HybridConnectionListener:
        as ``HybridConnectionStream`` instances.
     """
 
-    def __init__(self, address: str, token_provider: TokenProvider):
+    def __init__(self, address: str, token_provider: TokenProvider, *,
+                 transport=None, retry_policy=None, limits=None, stream_requests=False,
+                 subprotocols=None):
         """
         Initialize the HybridConnectionListener.
         
@@ -62,6 +70,14 @@ class HybridConnectionListener:
         """
         self._address = address
         self._token_provider = token_provider
+        self.transport = transport or TransportOptions()
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.limits = limits or ListenerLimits()
+        self.stream_requests = stream_requests
+        self.subprotocols = list(subprotocols or [])
+        self.tracking_id = str(uuid4())
+        self.last_error = None
+        self._terminal_failure = False
         self._websocket: Optional[Any] = None
         self._is_online = False
         self._protocol_handler = ProtocolHandler()
@@ -72,7 +88,7 @@ class HybridConnectionListener:
         self._ping_task: Optional[asyncio.Task] = None
         self._should_reconnect = False
         self._reconnect_attempt = 0
-        self._ping_interval = 30.0  # Send ping every 30 seconds
+        self._ping_interval = self.transport.ping_interval
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._close_complete = False
@@ -90,13 +106,16 @@ class HybridConnectionListener:
 
         # Queue of accepted rendezvous WebSocket streams produced by
         # sender 'connect' operations. Drained via ``accept_connection()``.
-        self._pending_connections: "asyncio.Queue[Optional[HybridConnectionStream]]" = asyncio.Queue()
+        self._pending_connections: "asyncio.Queue[Optional[HybridConnectionStream]]" = asyncio.Queue(
+            maxsize=self.limits.max_pending_connections
+        )
         self._open_streams: "set[HybridConnectionStream]" = set()
 
         # Event callbacks
         self.on_connecting: Optional[Callable[[], None]] = None
         self.on_online: Optional[Callable[[], None]] = None
         self.on_offline: Optional[Callable[[], None]] = None
+        self.on_stopped: Optional[Callable[[], None]] = None
 
         # Request handler for incoming HTTP requests.
         self.request_handler: Optional[
@@ -110,7 +129,7 @@ class HybridConnectionListener:
         self.accept_handler: Optional[AcceptHandler] = None
 
     @classmethod
-    def from_connection_string(cls, connection_string: str) -> "HybridConnectionListener":
+    def from_connection_string(cls, connection_string: str, *, credential=None, **options) -> "HybridConnectionListener":
         """
         Create a HybridConnectionListener from a connection string.
         
@@ -126,23 +145,25 @@ class HybridConnectionListener:
         # Validate required fields
         if not builder.endpoint:
             raise ValueError("Connection string missing Endpoint")
-        if not builder.shared_access_key_name:
-            raise ValueError("Connection string missing SharedAccessKeyName")
-        if not builder.shared_access_key:
-            raise ValueError("Connection string missing SharedAccessKey")
         if not builder.entity_path:
             raise ValueError("Connection string missing EntityPath")
         
         # Create token provider
-        token_provider = TokenProvider(
-            key_name=builder.shared_access_key_name,
-            shared_access_key=builder.shared_access_key
-        )
+        token_provider = builder.create_token_provider(credential)
+        if token_provider is None:
+            raise ValueError("Listener requires authentication")
+        if "transport" not in options and builder.operation_timeout is not None:
+            options["transport"] = TransportOptions(
+                open_timeout=builder.operation_timeout, write_timeout=builder.operation_timeout
+            )
         
         # Build the address (sb:// URI format)
         address = builder.build_uri()
         
-        return cls(address, token_provider)
+        return cls(address, token_provider, **options)
+
+    async def get_runtime_information(self):
+        return await get_runtime_information(self._address, self._token_provider, self.transport)
 
     @property
     def is_online(self) -> bool:
@@ -163,15 +184,18 @@ class HybridConnectionListener:
         async with self._lifecycle_lock:
             if self._should_reconnect:
                 return
+            if self._terminal_failure and not self._close_complete:
+                raise RuntimeError("Await close() before reopening a stopped listener")
             if self._closed:
                 if not self._close_complete:
                     raise RuntimeError(
                         "Listener shutdown is incomplete; await close() before reopening"
                     )
                 # Previous accept waiters must retain their closed queue.
-                self._pending_connections = asyncio.Queue()
+                self._pending_connections = asyncio.Queue(maxsize=self.limits.max_pending_connections)
                 self._closed = False
                 self._close_complete = False
+                self._terminal_failure = False
             self._should_reconnect = True
             self._reconnect_attempt = 0
             opened = False
@@ -184,6 +208,17 @@ class HybridConnectionListener:
                     await self._disconnect_control_channel()
     
     async def _connect(self) -> None:
+        try:
+            async with asyncio.timeout(self.transport.open_timeout):
+                await self._connect_core()
+        except TimeoutError as exc:
+            await self._disconnect_control_channel()
+            self.last_error = relay_error(exc, tracking_id=self.tracking_id, listener=True)
+            if self.last_error is exc:
+                raise
+            raise self.last_error from exc
+
+    async def _connect_core(self) -> None:
         """
         Internal method to establish the WebSocket connection.
         """
@@ -194,7 +229,8 @@ class HybridConnectionListener:
             namespace, path = self._split_address()
             
             # Get a token for authentication
-            self._current_token = self._token_provider.get_token(self._address)
+            async with asyncio.timeout(self.transport.open_timeout):
+                self._current_token = await acquire_token(self._token_provider, self._address)
             
             # Build the WebSocket control channel URL
             ws_url = self._protocol_handler.build_control_channel_url(
@@ -202,9 +238,12 @@ class HybridConnectionListener:
                 path=path,
                 token=self._current_token.token
             )
+            ws_url += "&sb-hc-id=" + quote(self.tracking_id, safe="")
             
             # Connect to the WebSocket
-            self._websocket = await websockets.connect(ws_url, ping_interval=None)
+            self._websocket = await self.transport.connect(
+                ws_url, default_factory=websockets.connect, ping_interval=None
+            )
             
             # Connection established - we're now online
             # Note: The control channel doesn't receive an initial message;
@@ -213,6 +252,8 @@ class HybridConnectionListener:
             
             self._is_online = True
             self._reconnect_attempt = 0  # Reset reconnect attempts on successful connection
+            self.last_error = None
+            logger.info("Listener online", extra={"tracking_id": self.tracking_id})
             
             # Fire online event
             if self.on_online:
@@ -225,13 +266,18 @@ class HybridConnectionListener:
             self._token_renewal_task = asyncio.create_task(self._token_renewal_loop())
             
             # Start ping/keepalive task
-            self._ping_task = asyncio.create_task(self._ping_loop())
+            if self._ping_interval is not None:
+                self._ping_task = asyncio.create_task(self._ping_loop())
                 
         except Exception as e:
             await self._disconnect_control_channel()
+            self.last_error = relay_error(e, tracking_id=self.tracking_id, listener=True)
+            self.last_error.args = (f"Failed to open listener: {self.last_error}",)
             if self.on_offline:
                 self.on_offline()
-            raise ConnectionError(f"Failed to open listener: {e}") from e
+            if self.last_error is e:
+                raise
+            raise self.last_error from e
 
     async def close(self) -> None:
         """
@@ -275,13 +321,16 @@ class HybridConnectionListener:
             for stream in queued_streams | self._open_streams:
                 try:
                     await stream.close()
-                except Exception:
-                    logger.exception("Failed to close a listener-owned stream")
+                except Exception as exc:
+                    logger.warning("Failed to close a listener-owned stream: %s", redact(exc))
+                    stream.abort()
             self._open_streams.clear()
             self._close_complete = True
 
             if was_online and self.on_offline:
                 self.on_offline()
+            if self.on_stopped:
+                self.on_stopped()
 
     async def _cancel_tasks(self, tasks: list[Optional[asyncio.Task]]) -> None:
         current = asyncio.current_task()
@@ -296,10 +345,8 @@ class HybridConnectionListener:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
-                logger.error(
-                    "Listener background task failed",
-                    exc_info=(type(result), result, result.__traceback__),
-                )
+                logger.error("Listener background task failed: %s", redact(result),
+                             extra={"tracking_id": self.tracking_id})
 
     async def _disconnect_control_channel(self) -> None:
         self._is_online = False
@@ -311,17 +358,26 @@ class HybridConnectionListener:
             )
             if websocket is not None:
                 try:
-                    await websocket.close()
-                except Exception:
-                    logger.exception("Failed to close the control WebSocket")
+                    async with asyncio.timeout(self.transport.close_timeout):
+                        await websocket.close()
+                except Exception as exc:
+                    logger.warning("Failed to close the control WebSocket: %s", redact(exc))
+                    websocket.transport.abort()
         except asyncio.CancelledError:
             self._websocket = websocket
             raise
 
-    def _on_connection_lost(self, websocket: Any) -> None:
+    def _on_connection_lost(self, websocket: Any, error=None) -> None:
         if websocket is not self._websocket or not self._is_online:
             return
         self._is_online = False
+        self.last_error = relay_error(
+            error or ConnectionError("Control connection lost"),
+            tracking_id=self.tracking_id, listener=True,
+        )
+        logger.warning("Listener disconnected: %s", self.last_error,
+                       extra={"tracking_id": self.tracking_id,
+                              "close_code": self.last_error.close_code})
         if self._should_reconnect and (
             self._reconnect_task is None or self._reconnect_task.done()
         ):
@@ -345,6 +401,8 @@ class HybridConnectionListener:
             ConnectionError: If the listener is closed while waiting.
         """
         queue = self._pending_connections
+        if not self._should_reconnect and self.last_error is not None and queue.empty():
+            raise self.last_error
         stream = await queue.get()
         if stream is None:
             queue.put_nowait(None)
@@ -403,6 +461,7 @@ class HybridConnectionListener:
                     continue
 
                 kind = parsed.get("kind")
+                overloaded = len(self._dispatch_tasks) >= self.limits.max_concurrent_requests
                 if kind == MESSAGE_KIND_REQUEST:
                     # Body, if any, arrives as the very next frame on the
                     # control channel; read it inline before dispatching so
@@ -410,16 +469,35 @@ class HybridConnectionListener:
                     body = b""
                     if parsed.get("body"):
                         body = await self._read_body_frames(websocket)
+                    if overloaded:
+                        response = RelayedHttpListenerResponse()
+                        response.status_code = 503
+                        response.status_description = "Listener capacity exceeded"
+                        await self._send_response(
+                            request_id=parsed["id"], response=response,
+                            rendezvous_address=parsed.get("address"), rendezvous_stream=None,
+                            control_websocket=websocket,
+                        )
+                        continue
                     self._spawn_dispatch(
                         self._handle_control_request(
                             parsed, body, control_websocket=websocket
                         )
                     )
                 elif kind == MESSAGE_KIND_REQUEST_POINTER:
+                    if overloaded:
+                        await self._handle_rendezvous_request(parsed.get("address"), reject=True)
+                        continue
                     self._spawn_dispatch(
                         self._handle_rendezvous_request(parsed.get("address"))
                     )
                 elif kind == MESSAGE_KIND_ACCEPT:
+                    if overloaded or self._pending_connections.full():
+                        await self._reject_rendezvous(
+                            address=parsed["address"], status_code=503,
+                            status_description="Listener capacity exceeded",
+                        )
+                        continue
                     self._spawn_dispatch(self._handle_accept(parsed))
                 elif kind == MESSAGE_KIND_RENEW_TOKEN:
                     # Listener never receives renewToken from the service;
@@ -432,15 +510,14 @@ class HybridConnectionListener:
                         kind,
                     )
 
-        except _WSConnectionClosed:
-            self._on_connection_lost(websocket)
+        except _WSConnectionClosed as exc:
+            self._on_connection_lost(websocket, exc)
 
         except asyncio.CancelledError:
             raise
 
-        except Exception:
-            logger.exception("HybridConnectionListener: receive loop error")
-            self._on_connection_lost(websocket)
+        except Exception as exc:
+            self._on_connection_lost(websocket, exc)
 
     def _spawn_dispatch(self, coro: Coroutine[Any, Any, None]) -> None:
         async def dispatch() -> None:
@@ -464,10 +541,8 @@ class HybridConnectionListener:
         if not task.cancelled():
             exception = task.exception()
             if exception is not None:
-                logger.error(
-                    "Failed to handle a relay message",
-                    exc_info=(type(exception), exception, exception.__traceback__),
-                )
+                logger.error("Failed to handle a relay message: %s", redact(exception),
+                             extra={"tracking_id": self.tracking_id})
 
     async def _read_body_frames(self, websocket: Any) -> bytes:
         """Read binary frames from ``websocket`` until one is received.
@@ -476,12 +551,15 @@ class HybridConnectionListener:
         a single ``recv()`` returns the full body content the service
         delivers for a request or response.
         """
-        frame = await websocket.recv()
+        async with asyncio.timeout(self.limits.body_timeout):
+            frame = await websocket.recv()
         if not self._protocol_handler.is_binary_message(frame):
             raise ValueError(
                 "Expected binary body frame after request/response message, "
                 f"got {type(frame).__name__}"
             )
+        if len(frame) > CONTROL_CHANNEL_MAX_BODY_SIZE:
+            raise ValueError("Control-channel body exceeds 64 KiB")
         return self._protocol_handler.decode_binary_body(frame)
 
     # ------------------------------------------------------------------ #
@@ -511,7 +589,7 @@ class HybridConnectionListener:
             control_websocket=control_websocket,
         )
 
-    async def _handle_rendezvous_request(self, address: Optional[str]) -> None:
+    async def _handle_rendezvous_request(self, address: Optional[str], reject=False) -> None:
         """Handle a request pointer requiring a rendezvous WebSocket.
 
         Opens the rendezvous WebSocket using ``sb-hc-action=request``,
@@ -526,20 +604,44 @@ class HybridConnectionListener:
         try:
             url = self._protocol_handler.build_rendezvous_request_url(address)
         except ValueError as exc:
-            logger.warning("Invalid rendezvous request URL: %s", exc)
+            logger.warning("Invalid rendezvous request URL: %s", redact(exc))
             return
 
         try:
-            websocket = await websockets.connect(url, max_size=None)
-        except Exception:
-            logger.exception("Failed to open rendezvous request WebSocket")
+            websocket = await self.transport.connect(
+                url, default_factory=websockets.connect, max_size=self.limits.max_http_body_size
+            )
+        except Exception as exc:
+            logger.warning("Failed to open rendezvous request WebSocket: %s", redact(exc))
             return
 
-        stream = HybridConnectionStream(websocket, address=url)
+        stream = HybridConnectionStream(websocket, address=url, transport=self.transport)
         if self._closed:
             await stream.close()
             return
         self._open_streams.add(stream)
+        if reject:
+            try:
+                async with asyncio.timeout(self.limits.body_timeout):
+                    payload, _ = await stream.receive()
+                parsed = self._protocol_handler.parse_control_message(payload)
+                response = RelayedHttpListenerResponse()
+                response.status_code = 503
+                response.status_description = "Listener capacity exceeded"
+                await self._send_response(
+                    request_id=parsed.get("id"), response=response, rendezvous_address=url,
+                    rendezvous_stream=stream, control_websocket=None,
+                )
+            finally:
+                try:
+                    await stream.close()
+                except Exception:
+                    stream.abort()
+                    self._open_streams.discard(stream)
+                    raise
+                else:
+                    self._open_streams.discard(stream)
+            return
         await self._serve_and_close_rendezvous(stream)
 
     async def _serve_and_close_rendezvous(
@@ -577,21 +679,25 @@ class HybridConnectionListener:
                 return
 
             body = b""
+            body_stream = None
             if parsed.get("body"):
-                payload, message_type = await stream.receive()
-                if message_type != "binary":
-                    logger.warning(
-                        "Expected binary body frame on rendezvous request, got %s",
-                        message_type,
+                if self.stream_requests:
+                    body_stream = RequestBody(
+                        stream.websocket, self.limits.max_http_body_size, self.limits.body_timeout
                     )
-                    return
-                body = payload
+                else:
+                    async with asyncio.timeout(self.limits.body_timeout):
+                        payload, message_type = await stream.receive()
+                    if message_type != "binary":
+                        raise ValueError("Expected binary HTTP request body")
+                    body = payload
 
             request = RelayedHttpListenerRequest(
                 http_method=parsed["method"],
                 url=parsed["requestTarget"],
                 headers=parsed.get("requestHeaders", {}),
                 body=body,
+                body_stream=body_stream,
             )
             await self._invoke_request_handler(
                 request=request,
@@ -600,6 +706,8 @@ class HybridConnectionListener:
                 rendezvous_stream=stream,
                 control_websocket=None,
             )
+            if body_stream is not None:
+                await body_stream.drain()
 
     async def _invoke_request_handler(
         self,
@@ -612,43 +720,118 @@ class HybridConnectionListener:
     ) -> None:
         """Run user request handler and send the response."""
         response_sent: dict = {"value": False}
+        writer = None
+        response_stream = rendezvous_stream
+        owns_stream = False
+        deadline = None
+
+        async def _flush(response):
+            nonlocal writer, response_stream, owns_stream
+            if self._closed:
+                raise ConnectionError("Listener is closed")
+            data = response.output_stream.take()
+            if not data:
+                return
+            if writer is None:
+                message = self._protocol_handler.build_response_message(
+                    request_id, response.status_code, response.status_description,
+                    response.headers, has_body=True,
+                )
+                response._started = True
+                if response_stream is None:
+                    if not rendezvous_address:
+                        raise ConnectionError("Streaming requires a rendezvous address")
+                    url = self._protocol_handler.build_rendezvous_request_url(rendezvous_address)
+                    ws = await self.transport.connect(
+                        url, default_factory=websockets.connect,
+                        max_size=self.limits.max_http_body_size,
+                    )
+                    response_stream = HybridConnectionStream(ws, address=url, transport=self.transport)
+                    owns_stream = True
+                    self._open_streams.add(response_stream)
+                await response_stream.send_text(message)
+                writer = ResponseWriter(response_stream.websocket, self.transport.write_timeout)
+            await writer.write(data)
+            if deadline is not None and not deadline.expired():
+                deadline.reschedule(asyncio.get_running_loop().time() + self.limits.body_timeout)
 
         async def _on_close(response: RelayedHttpListenerResponse) -> None:
             if response_sent["value"]:
                 return
+            if writer is not None:
+                await _flush(response)
+                await writer.finish()
+                if owns_stream:
+                    self._spawn_dispatch(self._serve_and_close_rendezvous(response_stream))
+            else:
+                await self._send_response(
+                    request_id=request_id,
+                    response=response,
+                    rendezvous_address=rendezvous_address,
+                    rendezvous_stream=rendezvous_stream,
+                    control_websocket=control_websocket,
+                )
             response_sent["value"] = True
-            await self._send_response(
-                request_id=request_id,
-                response=response,
-                rendezvous_address=rendezvous_address,
-                rendezvous_stream=rendezvous_stream,
-                control_websocket=control_websocket,
-            )
+            response._started = True
+            logger.info("HTTP response sent", extra={
+                "tracking_id": request_id, "status_code": response.status_code,
+                "channel": "rendezvous" if writer is not None or rendezvous_stream is not None else "automatic",
+            })
+            if deadline is not None and not deadline.expired():
+                deadline.reschedule(asyncio.get_running_loop().time() + self.limits.body_timeout)
 
         context = RelayedHttpListenerContext(
             request,
             tracking_id=request_id,
             rendezvous_address=rendezvous_address,
             response_close_callback=_on_close,
+            response_flush_callback=_flush,
+            response_buffer_limit=self.limits.max_response_buffer_size,
+            response_flush_interval=self.limits.response_flush_interval,
         )
 
-        if self.request_handler is None:
-            # No handler: respond with 501 Not Implemented per .NET behavior.
-            context.response.status_code = 501
-            context.response.status_description = "Not Implemented"
-        else:
-            try:
-                result = self.request_handler(context)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                logger.exception("Request handler raised an exception")
-                if not response_sent["value"] and not context.response.is_closed:
+        logger.debug("HTTP request received", extra={"tracking_id": request_id,
+                                                    "method": request.http_method})
+        try:
+            async with asyncio.timeout(self.limits.request_timeout) as deadline:
+                if self.request_handler is None:
+                    context.response.status_code = 501
+                    context.response.status_description = "Not Implemented"
+                else:
+                    try:
+                        result = self.request_handler(context)
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception as exc:
+                        if context.response.failure is not None or context.response.has_started:
+                            raise
+                        logger.warning("Request handler failed: %s", redact(exc),
+                                       extra={"tracking_id": request_id})
+                        if not response_sent["value"]:
+                            context.response.output_stream.take()
+                            context.response.headers.clear()
+                            context.response.status_code = 500
+                            context.response.status_description = "Internal Server Error"
+                if not response_sent["value"]:
+                    await context.response.close()
+        except TimeoutError as exc:
+            if not context.response.has_started and context.response.failure is None:
+                await context.response.cancel_pending_flush()
+                if not context.response.is_closed:
+                    context.response.output_stream.take()
+                    context.response.headers.clear()
                     context.response.status_code = 500
-                    context.response.status_description = "Internal Server Error"
-
-        if not response_sent["value"]:
-            await context.response.close()
+                    context.response.status_description = "Request deadline exceeded"
+                    await context.response.close()
+            raise relay_error(exc, tracking_id=request_id) from exc
+        finally:
+            await context.response.cancel_pending_flush()
+            if not response_sent["value"]:
+                if writer is not None:
+                    await writer.abort()
+                if response_stream is not None:
+                    await response_stream.close()
+                    self._open_streams.discard(response_stream)
 
     async def _send_response(
         self,
@@ -680,17 +863,24 @@ class HybridConnectionListener:
             return
 
         if len(body) <= CONTROL_CHANNEL_MAX_BODY_SIZE:
-            async with self._control_send_lock:
-                if (
-                    control_websocket is not None
-                    and control_websocket is self._websocket
-                ):
-                    await control_websocket.send(response_message)
-                    if has_body:
-                        await control_websocket.send(
-                            self._protocol_handler.encode_binary_body(body)
-                        )
-                    return
+            try:
+                async with asyncio.timeout(self.transport.write_timeout), self._control_send_lock:
+                    if (
+                        control_websocket is not None
+                        and control_websocket is self._websocket
+                    ):
+                        await control_websocket.send(response_message)
+                        if has_body:
+                            await control_websocket.send(
+                                self._protocol_handler.encode_binary_body(body)
+                            )
+                        return
+            except BaseException as exc:
+                # After sending the envelope, a retry could interleave or duplicate
+                # the body. Retire this channel instead of replaying the response.
+                error = exc if isinstance(exc, Exception) else ConnectionError("Control response send cancelled")
+                self._on_connection_lost(control_websocket, error)
+                raise
 
         # A replacement control channel cannot respond to the old one's requests.
         if not rendezvous_address:
@@ -714,8 +904,10 @@ class HybridConnectionListener:
         if self._closed:
             raise ConnectionError("Cannot upgrade response: listener is closed")
         url = self._protocol_handler.build_rendezvous_request_url(rendezvous_address)
-        websocket = await websockets.connect(url, max_size=None)
-        stream = HybridConnectionStream(websocket, address=url)
+        websocket = await self.transport.connect(
+            url, default_factory=websockets.connect, max_size=self.limits.max_http_body_size
+        )
+        stream = HybridConnectionStream(websocket, address=url, transport=self.transport)
         if self._closed:
             await stream.close()
             raise ConnectionError("Listener closed while upgrading the response")
@@ -737,6 +929,19 @@ class HybridConnectionListener:
     # ------------------------------------------------------------------ #
 
     async def _handle_accept(self, parsed: dict) -> None:
+        try:
+            async with asyncio.timeout(self.limits.accept_timeout):
+                await self._handle_accept_core(parsed)
+        except TimeoutError:
+            logger.warning("Accept deadline exceeded", extra={"tracking_id": parsed.get("id")})
+            if parsed.get("address"):
+                async with asyncio.timeout(self.transport.open_timeout):
+                    await self._reject_rendezvous(
+                        address=parsed["address"], status_code=408,
+                        status_description="Listener accept deadline exceeded",
+                    )
+
+    async def _handle_accept_core(self, parsed: dict) -> None:
         """Process an accept message: invoke ``accept_handler`` and connect."""
         address = parsed.get("address")
         if not address:
@@ -747,10 +952,9 @@ class HybridConnectionListener:
         connect_headers = parsed.get("connect_headers", {}) or {}
 
         # Build a synthetic request from the connect headers for inspection.
-        host = connect_headers.get("Host") or connect_headers.get("host") or ""
         synthetic_request = RelayedHttpListenerRequest(
             http_method="GET",
-            url=f"wss://{host}" if host else address,
+            url=self._protocol_handler.logical_accept_url(self._address, address),
             headers=connect_headers,
         )
         context = RelayedHttpListenerContext(
@@ -760,18 +964,28 @@ class HybridConnectionListener:
             rendezvous_address=address,
         )
 
+        offered = [
+            item.strip() for item in
+            (synthetic_request.get_header("Sec-WebSocket-Protocol") or "").split(",")
+            if item.strip()
+        ]
+        selected = next((p for p in self.subprotocols if p in offered), None)
+        if selected is not None:
+            context.response.headers["Sec-WebSocket-Protocol"] = selected
         accept = True
         if self.accept_handler is not None:
             try:
                 result = self.accept_handler(context)
                 if inspect.isawaitable(result):
-                    result = await result
+                    async with asyncio.timeout(self.limits.accept_timeout):
+                        result = await result
                 if result is None:
                     accept = True
                 else:
                     accept = bool(result)
-            except Exception:
-                logger.exception("AcceptHandler raised an exception; rejecting")
+            except Exception as exc:
+                logger.warning("AcceptHandler raised an exception; rejecting: %s", redact(exc),
+                               extra={"tracking_id": tracking_id})
                 if not context.response.is_closed:
                     context.response.status_code = 502
                     context.response.status_description = (
@@ -779,8 +993,18 @@ class HybridConnectionListener:
                     )
                 accept = False
 
+        selected = next((value for key, value in context.response.headers.items()
+                         if key.lower() == "sec-websocket-protocol"), None)
+        if accept and offered and selected not in offered:
+            accept = False
+            context.response.status_code = 400
+            context.response.status_description = "No supported WebSocket subprotocol"
+        if accept and selected and selected not in offered:
+            accept = False
+            context.response.status_code = 400
+            context.response.status_description = "Selected subprotocol was not offered"
         if accept:
-            await self._accept_rendezvous(address, tracking_id, connect_headers)
+            await self._accept_rendezvous(address, tracking_id, connect_headers, selected)
         else:
             # If the handler did not explicitly set a non-200 status, default
             # to 400 / "Rejected by user code" to mirror the .NET behavior.
@@ -801,14 +1025,19 @@ class HybridConnectionListener:
         address: str,
         tracking_id: Optional[str],
         connect_headers: dict,
+        subprotocol: Optional[str] = None,
     ) -> None:
         try:
             url = self._protocol_handler.build_rendezvous_accept_url(address)
             # Relay forwards these extension headers as the sender's server response.
             # A client compression offer isn't a valid server negotiation response.
-            websocket = await websockets.connect(url, compression=None)
-        except Exception:
-            logger.exception("Failed to open rendezvous accept WebSocket")
+            websocket = await self.transport.connect(
+                url, default_factory=websockets.connect, compression=None,
+                subprotocols=[subprotocol] if subprotocol else None,
+            )
+        except Exception as exc:
+            logger.warning("Failed to open rendezvous accept WebSocket: %s", redact(exc),
+                           extra={"tracking_id": tracking_id})
             return
 
         stream = HybridConnectionStream(
@@ -816,12 +1045,20 @@ class HybridConnectionListener:
             tracking_id=tracking_id,
             connect_headers=connect_headers,
             address=url,
+            transport=self.transport,
         )
         if self._closed:
             await stream.close()
             return
         self._open_streams.add(stream)
-        await self._pending_connections.put(stream)
+        if self._pending_connections.full():
+            logger.warning("Accepted stream queue is full", extra={"tracking_id": tracking_id})
+            await stream.close(code=1013, reason="Listener capacity exceeded")
+            self._open_streams.discard(stream)
+        else:
+            self._pending_connections.put_nowait(stream)
+            logger.info("Rendezvous accepted", extra={"tracking_id": tracking_id,
+                                                     "subprotocol": subprotocol})
 
     async def _reject_rendezvous(
         self,
@@ -836,8 +1073,8 @@ class HybridConnectionListener:
                 status_code=status_code,
                 status_description=status_description,
             )
-        except ValueError:
-            logger.exception("Invalid reject URL")
+        except ValueError as exc:
+            logger.warning("Invalid reject URL: %s", redact(exc))
             return
 
         try:
@@ -848,22 +1085,22 @@ class HybridConnectionListener:
             # successful path; any other failure is logged at WARNING for
             # diagnosability. If for some reason the WebSocket succeeds
             # we still close it (the rejection has already taken effect).
-            ws = await websockets.connect(url)
+            ws = await self.transport.connect(url, default_factory=websockets.connect)
         except Exception as exc:
-            message = str(exc)
-            if "410" in message:
+            if getattr(getattr(exc, "response", None), "status_code", None) == 410:
                 logger.debug("Rendezvous reject handshake completed (HTTP 410)")
             else:
                 logger.warning(
                     "Rendezvous reject handshake failed with unexpected error: %s",
-                    exc,
+                    redact(exc),
                 )
             return
 
         try:
             await ws.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to close rejection socket: %s", redact(exc))
+            ws.transport.abort()
 
     # ------------------------------------------------------------------ #
     # Misc
@@ -892,41 +1129,45 @@ class HybridConnectionListener:
                 expires_in = self._current_token.expires_in_seconds()
                 
                 # Renew when 50% of validity remains (or if already expired)
-                token_validity = self._token_provider.token_validity_seconds
+                token_validity = getattr(self._token_provider, "token_validity_seconds", 600)
                 renewal_threshold = token_validity * 0.5
                 
                 if expires_in <= renewal_threshold:
                     # Time to renew the token
                     try:
                         # Generate a new token
-                        new_token = self._token_provider.get_token(self._address)
+                        async with asyncio.timeout(self.transport.open_timeout):
+                            new_token = await acquire_token(self._token_provider, self._address)
                         
                         # Send renewToken message to the relay
                         renew_message = self._protocol_handler.build_renew_token_message(
                             new_token.token
                         )
-                        async with self._control_send_lock:
+                        async with asyncio.timeout(self.transport.write_timeout), self._control_send_lock:
                             if not self._is_online or self._websocket is not websocket:
                                 break
                             await websocket.send(renew_message)
                             self._current_token = new_token
+                        logger.info("Listener token renewed", extra={
+                            "tracking_id": self.tracking_id,
+                            "expires_at": new_token.expires_at_utc,
+                        })
 
                     except (_WSConnectionClosed, OSError) as exc:
-                        logger.warning("Token renewal lost the control channel: %s", exc)
-                        self._on_connection_lost(websocket)
+                        logger.warning("Token renewal lost the control channel: %s", redact(exc))
+                        self._on_connection_lost(websocket, exc)
                         return
-                    except Exception:
-                        logger.exception("Failed to renew the listener token; will retry")
+                    except Exception as exc:
+                        logger.warning("Failed to renew the listener token; will retry: %s", redact(exc))
                 
                 # Wait before checking again (check every 10% of validity period, or 1 second minimum)
-                check_interval = max(1, token_validity * 0.1)
+                check_interval = max(0.1, min(token_validity * 0.1, max(0.1, expires_in / 2)))
                 await asyncio.sleep(check_interval)
                 
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Listener token renewal loop failed")
-            self._on_connection_lost(websocket)
+        except Exception as exc:
+            self._on_connection_lost(websocket, exc)
     
     async def _reconnect_loop(self) -> None:
         """
@@ -936,12 +1177,33 @@ class HybridConnectionListener:
         is lost, using exponential backoff between attempts.
         """
         try:
+            started = asyncio.get_running_loop().time()
             async with self._lifecycle_lock:
                 await self._disconnect_control_channel()
             while self._should_reconnect and not self._is_online:
                 # Calculate backoff delay (exponential: 1s, 2s, 4s, 8s, 16s, max 60s)
                 self._reconnect_attempt += 1
-                delay = min(2 ** min(self._reconnect_attempt - 1, 6), 60)
+                policy = self.retry_policy
+                delay = policy.delay(self._reconnect_attempt)
+                elapsed = asyncio.get_running_loop().time() - started
+                if (
+                    (self.last_error is not None and not self.last_error.is_transient)
+                    or (policy.max_attempts is not None and self._reconnect_attempt > policy.max_attempts)
+                    or (policy.max_elapsed is not None and elapsed + delay >= policy.max_elapsed)
+                ):
+                    self._should_reconnect = False
+                    self._terminal_failure = True
+                    if not self._pending_connections.full():
+                        self._pending_connections.put_nowait(None)
+                    logger.error("Listener reconnection stopped: %s", self.last_error,
+                                 extra={"tracking_id": self.tracking_id})
+                    if self.on_stopped:
+                        self.on_stopped()
+                    return
+                logger.info("Listener reconnect scheduled", extra={
+                    "tracking_id": self.tracking_id,
+                    "attempt": self._reconnect_attempt, "delay": delay,
+                })
                 
                 # Wait before attempting reconnection
                 await asyncio.sleep(delay)
@@ -950,16 +1212,31 @@ class HybridConnectionListener:
                     async with self._lifecycle_lock:
                         if not self._should_reconnect or self._is_online:
                             return
-                        await self._connect()
-                except ConnectionError:
-                    logger.warning("Listener reconnection failed; will retry", exc_info=True)
+                        remaining = (
+                            max(0, policy.max_elapsed - (asyncio.get_running_loop().time() - started))
+                            if policy.max_elapsed is not None else None
+                        )
+                        async with asyncio.timeout(remaining):
+                            await self._connect()
+                except (ConnectionError, TimeoutError) as exc:
+                    await self._disconnect_control_channel()
+                    self.last_error = relay_error(exc, tracking_id=self.tracking_id, listener=True)
+                    logger.warning("Listener reconnection failed: %s", self.last_error,
+                                   extra={"tracking_id": self.tracking_id})
                 else:
                     return
                     
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Listener reconnection loop failed")
+        except Exception as exc:
+            logger.error("Listener reconnection loop failed: %s", redact(exc))
+            self.last_error = relay_error(exc, tracking_id=self.tracking_id, listener=True)
+            self._should_reconnect = False
+            self._terminal_failure = True
+            if not self._pending_connections.full():
+                self._pending_connections.put_nowait(None)
+            if self.on_stopped:
+                self.on_stopped()
     
     async def _ping_loop(self) -> None:
         """
@@ -981,23 +1258,22 @@ class HybridConnectionListener:
                 
                 try:
                     # Send a WebSocket ping
-                    pong_waiter = await websocket.ping()
+                    async with asyncio.timeout(self.transport.write_timeout):
+                        pong_waiter = await websocket.ping()
                     
                     # Wait for pong response with timeout
-                    await asyncio.wait_for(pong_waiter, timeout=10.0)
+                    await asyncio.wait_for(pong_waiter, timeout=self.transport.ping_timeout)
                     
                 except (asyncio.TimeoutError, _WSConnectionClosed, OSError) as exc:
-                    logger.warning("Listener keepalive failed: %s", exc)
-                    self._on_connection_lost(websocket)
+                    logger.warning("Listener keepalive failed: %s", redact(exc))
+                    self._on_connection_lost(websocket, exc)
                     break
                     
-                except Exception:
-                    logger.exception("Listener keepalive failed")
-                    self._on_connection_lost(websocket)
+                except Exception as exc:
+                    self._on_connection_lost(websocket, exc)
                     break
                     
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Listener keepalive loop failed")
-            self._on_connection_lost(websocket)
+        except Exception as exc:
+            self._on_connection_lost(websocket, exc)

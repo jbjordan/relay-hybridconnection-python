@@ -4,8 +4,10 @@ import base64
 import hashlib
 import hmac
 import time
+import inspect
+import math
 from typing import Optional
-from urllib.parse import quote_plus, urlsplit, urlunsplit
+from urllib.parse import quote_plus, urlsplit, urlunsplit, parse_qs
 
 
 class SecurityToken:
@@ -74,7 +76,7 @@ class TokenProvider:
             raise ValueError("key_name cannot be empty")
         if not shared_access_key:
             raise ValueError("shared_access_key cannot be empty")
-        if token_validity_seconds <= 0:
+        if not math.isfinite(token_validity_seconds) or token_validity_seconds <= 0:
             raise ValueError("token_validity_seconds must be positive")
 
         self._key_name = key_name
@@ -109,6 +111,21 @@ class TokenProvider:
         expires_at_utc = time.time() + self._token_validity_seconds
         token = self._generate_sas_token(audience, expires_at_utc)
         return SecurityToken(token, expires_at_utc, audience)
+
+    async def get_token_async(self, audience: str) -> SecurityToken:
+        return self.get_token(audience)
+
+    @staticmethod
+    def from_sas_token(token: str) -> "SasTokenProvider":
+        return SasTokenProvider(token)
+
+    @staticmethod
+    def from_credential(credential) -> "AzureIdentityTokenProvider":
+        """Adapt an azure.core.credentials_async.AsyncTokenCredential.
+
+        The caller owns and closes the credential.
+        """
+        return AzureIdentityTokenProvider(credential)
 
     def _generate_sas_token(self, audience: str, expires_at_utc: float) -> str:
         """Generate the SAS token string.
@@ -195,3 +212,60 @@ class TokenProvider:
         if token_validity_seconds is not None:
             return cls(key_name, shared_access_key, token_validity_seconds)
         return cls(key_name, shared_access_key)
+
+
+class SasTokenProvider:
+    """Use a preissued SAS without storing its signing key."""
+
+    def __init__(self, token: str):
+        if not token.startswith("SharedAccessSignature "):
+            raise ValueError("Expected a SharedAccessSignature token")
+        try:
+            parts = parse_qs(token.split(" ", 1)[1], strict_parsing=True)
+            expiry = float(parts["se"][0])
+            if not math.isfinite(expiry) or expiry <= 0:
+                raise ValueError("Invalid SAS expiry")
+            if any(len(values) != 1 for values in parts.values()):
+                raise ValueError("Duplicate SAS token field")
+            self._token = SecurityToken(token, expiry, parts["sr"][0])
+            if not parts["sig"][0]:
+                raise ValueError("Empty signature")
+        except (KeyError, ValueError, IndexError) as exc:
+            raise ValueError("Invalid SAS token fields") from exc
+
+    def get_token(self, audience: str) -> SecurityToken:
+        if self._token.is_expired:
+            from .errors import AuthorizationError
+            raise AuthorizationError("Preissued SAS token has expired", is_transient=False)
+        return self._token
+
+    async def get_token_async(self, audience: str) -> SecurityToken:
+        return self.get_token(audience)
+
+
+class AzureIdentityTokenProvider:
+    """Relay tokens from an async Azure Identity credential."""
+
+    def __init__(self, credential):
+        self.credential = credential
+
+    async def get_token_async(self, audience: str) -> SecurityToken:
+        result = self.credential.get_token("https://relay.azure.net/.default")
+        if not inspect.isawaitable(result):
+            raise TypeError("Use an async credential from azure.identity.aio")
+        token = await result
+        return SecurityToken(token.token, token.expires_on, "https://relay.azure.net/")
+
+
+async def acquire_token(provider, audience: str) -> SecurityToken:
+    """Support existing synchronous providers as well as async credentials."""
+    method = getattr(provider, "get_token_async", None)
+    token = await method(audience) if method else provider.get_token(audience)
+    if not isinstance(token.token, str) or not token.token:
+        raise ValueError("Token provider returned an empty or invalid token")
+    if not math.isfinite(token.expires_at_utc):
+        raise ValueError("Token provider returned an invalid expiry")
+    if token.is_expired:
+        from .errors import AuthorizationError
+        raise AuthorizationError("Token provider returned an expired token", is_transient=False)
+    return token

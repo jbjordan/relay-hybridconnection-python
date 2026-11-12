@@ -231,8 +231,9 @@ class TestStreamAsyncIteration:
         ws.recv.side_effect = ConnectionResetError("Connection reset")
         stream = HybridConnectionStream(ws)
 
-        with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionError) as caught:
             await anext(stream)
+        assert isinstance(caught.value.__cause__, ConnectionResetError)
 
     @pytest.mark.asyncio
     async def test_async_iteration_yields_messages(self):
